@@ -1,0 +1,242 @@
+--- a/arch/mips/include/asm/octeon/cvmx-helper-cfg.h
++++ b/arch/mips/include/asm/octeon/cvmx-helper-cfg.h
+@@ -133,6 +133,7 @@
+ 	uint8_t rgmii_tx_clk_delay;	/** RGMII TX clock delay value if not bypassed */
+ 	bool valid:1;			/** 1 = port valid, 0 = invalid */
+ 	bool sgmii_phy_mode:1;		/** 1 = port in PHY mode, 0 = MAC mode */
++	bool sgmii_inband:1;
+ 	bool sgmii_1000x_mode:1;	/** 1 = 1000Base-X mode, 0 = SGMII mode */
+ 	bool agl_rx_clk_delay_bypass:1;	/** 1 = use rx clock delay bypass for AGL mode */
+ 	bool force_link_up:1;		/** Ignore PHY and always report link up */
+@@ -483,6 +484,9 @@
+ extern bool cvmx_helper_get_1000x_mode(int interface, int index);
+ extern void cvmx_helper_set_1000x_mode(int interface, int index, bool valid);
+ 
++bool cvmx_helper_get_sgmii_inband(int interface, int index);
++void cvmx_helper_set_sgmii_inband(int interface, int index, bool enabled);
++
+ /**
+  * @INTERNAL
+  * Return if an AGL port should bypass the RX clock delay
+--- a/arch/mips/cavium-octeon/executive/cvmx-helper-cfg.c
++++ b/arch/mips/cavium-octeon/executive/cvmx-helper-cfg.c
+@@ -698,6 +698,26 @@
+ 	return cvmx_cfg_port[xi.node][xi.interface][index].sgmii_1000x_mode;
+ }
+ EXPORT_SYMBOL(cvmx_helper_get_1000x_mode);
++
++void cvmx_helper_set_sgmii_inband(int xiface, int index, bool enabled)
++{
++	struct cvmx_xiface xi = cvmx_helper_xiface_to_node_interface(xiface);
++
++	if (!port_cfg_data_initialized)
++		cvmx_init_port_cfg();
++	cvmx_cfg_port[xi.node][xi.interface][index].sgmii_inband = enabled;
++}
++EXPORT_SYMBOL(cvmx_helper_set_sgmii_inband);
++
++bool cvmx_helper_get_sgmii_inband(int xiface, int index)
++{
++	struct cvmx_xiface xi = cvmx_helper_xiface_to_node_interface(xiface);
++
++	if (!port_cfg_data_initialized)
++		cvmx_init_port_cfg();
++	return cvmx_cfg_port[xi.node][xi.interface][index].sgmii_inband;
++}
++EXPORT_SYMBOL(cvmx_helper_get_sgmii_inband);
+ 
+ void cvmx_helper_set_agl_rx_clock_delay_bypass(int xiface, int index,
+ 					       bool valid)
+--- a/arch/mips/cavium-octeon/executive/cvmx-helper-sgmii.c
++++ b/arch/mips/cavium-octeon/executive/cvmx-helper-sgmii.c
+@@ -190,6 +190,7 @@
+ 	 * Write PCS*_MR*_CONTROL_REG[RST_AN]=1 to ensure a fresh
+ 	 * sgmii negotiation starts.
+ 	 */
++	control_reg.s.reset = 0;
+ 	control_reg.s.rst_an = 1;
+ 	control_reg.s.an_en = 1;
+ 	control_reg.s.pwr_dn = 0;
+@@ -370,6 +371,19 @@
+ 	for (index = 0; index < num_ports; index++) {
+ 		int ipd_port = cvmx_helper_get_ipd_port(interface, index);
+ 		__cvmx_helper_sgmii_hardware_init_one_time(interface, index);
++		if (cvmx_helper_get_sgmii_inband(interface, index)) {
++			union cvmx_pcsx_miscx_ctl_reg misc;
++
++			/* Keep packet I/O gated until the module reports link. */
++			misc.u64 = cvmx_read_csr(CVMX_PCSX_MISCX_CTL_REG(index, interface));
++			misc.s.gmxeno = 1;
++			cvmx_write_csr(CVMX_PCSX_MISCX_CTL_REG(index, interface), misc.u64);
++
++			/* Empty cages are expected. The PCS keeps negotiating. */
++			__cvmx_helper_sgmii_hardware_init_link(interface, index);
++			pr_info("SGMII%d/%d: using PCS in-band link status\n",
++				interface, index);
++		}
+ 		/* Linux kernel driver will call ....link_set with the
+ 		 * proper link state. In the simulator there is no
+ 		 * link state polling and hence it is set from
+@@ -481,6 +495,36 @@
+ 
+ 	pcs_misc_ctl_reg.u64 =
+ 	    cvmx_read_csr(CVMX_PCSX_MISCX_CTL_REG(index, interface));
++	if (cvmx_helper_get_sgmii_inband(interface, index)) {
++		union cvmx_pcsx_mrx_status_reg status;
++		union cvmx_pcsx_anx_results_reg an;
++
++		/* The link bit is latched low until the first read. */
++		cvmx_read_csr(CVMX_PCSX_MRX_STATUS_REG(index, interface));
++		status.u64 = cvmx_read_csr(CVMX_PCSX_MRX_STATUS_REG(index, interface));
++		an.u64 = cvmx_read_csr(CVMX_PCSX_ANX_RESULTS_REG(index, interface));
++
++		if (!status.s.lnk_st || !an.s.an_cpt || !an.s.link_ok)
++			return result;
++
++		switch (an.s.spd) {
++		case 0:
++			result.s.speed = 10;
++			break;
++		case 1:
++			result.s.speed = 100;
++			break;
++		case 2:
++			result.s.speed = 1000;
++			break;
++		default:
++			return result;
++		}
++		result.s.full_duplex = an.s.dup;
++		result.s.link_up = 1;
++		return result;
++	}
++
+ 	if (pcs_misc_ctl_reg.s.mac_phy ||
+ 	    cvmx_helper_get_port_force_link_up(interface, index)) {
+ 		/* PHY Mode */
+@@ -514,7 +558,13 @@
+ 	int interface = cvmx_helper_get_interface_num(ipd_port);
+ 	int index = cvmx_helper_get_interface_index_num(ipd_port);
+ 
+-		/* For some devices, i.e. the Qualcomm QCA8337 switch we need to power
++	/* Applying the reported speed must not restart in-band negotiation. */
++	if (cvmx_helper_get_sgmii_inband(interface, index))
++		return __cvmx_helper_sgmii_hardware_init_link_speed(interface,
++								    index,
++								    link_info);
++
++	/* For some devices, i.e. the Qualcomm QCA8337 switch we need to power
+ 	 * down the PCS interface when the link goes down and power it back
+ 	 * up when the link returns.
+ 	 */
+--- a/drivers/staging/octeon/ethernet.c
++++ b/drivers/staging/octeon/ethernet.c
+@@ -456,6 +456,13 @@
+ 		phy_disconnect(dev->phydev);
+ }
+ 
++static bool cvm_oct_uses_sgmii_inband(const struct octeon_ethernet *priv)
++{
++	return priv->imode == CVMX_HELPER_INTERFACE_MODE_SGMII &&
++	       cvmx_helper_get_sgmii_inband(INTERFACE(priv->port),
++					   INDEX(priv->port));
++}
++
+ int cvm_oct_common_open(struct net_device *dev,
+ 			void (*link_poll)(struct net_device *))
+ {
+@@ -463,12 +470,16 @@
+ 	struct octeon_ethernet *priv = netdev_priv(dev);
+ 	int interface = INTERFACE(priv->port);
+ 	int index = INDEX(priv->port);
+-	union cvmx_helper_link_info link_info;
+ 	int rv;
+ 
+-	rv = cvm_oct_phy_setup_device(dev);
+-	if (rv)
+-		return rv;
++	if (cvm_oct_uses_sgmii_inband(priv)) {
++		priv->link_info = 0;
++		netif_carrier_off(dev);
++	} else {
++		rv = cvm_oct_phy_setup_device(dev);
++		if (rv)
++			return rv;
++	}
+ 
+ 	gmx_cfg.u64 = cvmx_read_csr(CVMX_GMXX_PRTX_CFG(index, interface));
+ 	gmx_cfg.s.en = 1;
+@@ -486,15 +497,6 @@
+ 			netif_carrier_off(dev);
+ 		cvm_oct_adjust_link(dev);
+ 	} else {
+-#if 0
+-		link_info = cvmx_helper_link_get(priv->port);
+-#else
+-    link_info.s.link_up = 1;
+-    link_info.s.full_duplex = 1;
+-    link_info.s.speed = 1000;
+-#endif
+-		if (!link_info.s.link_up)
+-			netif_carrier_off(dev);
+ 		priv->poll = link_poll;
+ 		link_poll(dev);
+ 	}
+@@ -507,12 +509,14 @@
+ 	struct octeon_ethernet *priv = netdev_priv(dev);
+ 	union cvmx_helper_link_info link_info;
+ 
+-#if 0
+-	link_info = cvmx_helper_link_get(priv->port);
+-#endif
+-  link_info.s.link_up = 1;
+-  link_info.s.full_duplex = 1;
+-  link_info.s.speed = 1000;
++	if (cvm_oct_uses_sgmii_inband(priv)) {
++		link_info = cvmx_helper_link_get(priv->port);
++	} else {
++		link_info.u64 = 0;
++		link_info.s.link_up = 1;
++		link_info.s.full_duplex = 1;
++		link_info.s.speed = 1000;
++	}
+ 
+ 	if (link_info.u64 == priv->link_info)
+ 		return;
+@@ -738,13 +742,23 @@
+ 				break;
+ 			case CVMX_HELPER_INTERFACE_MODE_SGMII:
+ 			{
++				phy_interface_t phy_mode;
++				bool inband;
++
++				inband = port_node &&
++					 !of_get_phy_mode(port_node, &phy_mode) &&
++					 phy_mode == PHY_INTERFACE_MODE_SGMII &&
++					 of_property_match_string(port_node,
++								  "managed",
++								  "in-band-status") >= 0;
++				cvmx_helper_set_sgmii_inband(i, j, inband);
+ 				if (port_node != NULL)
+ 					cvmx_helper_set_port_valid(i, j, true);
+ 				else
+ 					cvmx_helper_set_port_valid(i, j, false);
+ 				cvmx_helper_set_mac_phy_mode(i, j, false);
+ 				cvmx_helper_set_1000x_mode(i, j, false);
+-				if (port_node) {
++				if (port_node && !inband) {
+ 					if (of_get_property(port_node,
+ 					     "cavium,sgmii-mac-phy-mode", NULL) != NULL) {
+             pr_info("sgmii-mac-phy-mode found, setting..\n");
+@@ -1009,7 +1023,10 @@
+ 				break;
+ 			}
+ 
+-			if (priv->of_node && of_phy_is_fixed_link(priv->of_node)) {
++			if (cvm_oct_uses_sgmii_inband(priv)) {
++				netif_carrier_off(dev);
++			} else if (priv->of_node &&
++				   of_phy_is_fixed_link(priv->of_node)) {
+ 				if (of_phy_register_fixed_link(priv->of_node)) {
+ 					netdev_err(dev, "Failed to register fixed link for interface %d, port %d\n",
+ 						   interface, priv->port);

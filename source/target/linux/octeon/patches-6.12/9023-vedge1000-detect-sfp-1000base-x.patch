@@ -1,0 +1,153 @@
+--- a/arch/mips/include/asm/octeon/cvmx-helper-sgmii.h
++++ b/arch/mips/include/asm/octeon/cvmx-helper-sgmii.h
+@@ -59,6 +59,8 @@
+ extern int __cvmx_helper_sgmii_enable(int interface);
+ void cvmx_helper_sgmii_restart_inband(int ipd_port, bool hard_reset);
+ void cvmx_helper_sgmii_report_inband(int ipd_port, const char *port_name);
++u16 cvmx_helper_sgmii_1000x_partner(int ipd_port);
++void cvmx_helper_sgmii_set_inband_1000x(int ipd_port, bool enable);
+ 
+ /**
+  * Return the link state of an IPD/PKO port as returned by
+--- a/arch/mips/cavium-octeon/executive/cvmx-helper-sgmii.c
++++ b/arch/mips/cavium-octeon/executive/cvmx-helper-sgmii.c
+@@ -29,6 +29,8 @@
+  * Functions for SGMII initialization, configuration,
+  * and monitoring.
+  */
++
++#include <linux/mii.h>
+ 
+ #include <asm/octeon/octeon.h>
+ 
+@@ -499,6 +501,63 @@
+ 	return 0;
+ }
+ 
++static bool cvmx_helper_sgmii_is_1000x_word(u16 word)
++{
++	const u16 allowed = LPA_1000XFULL | LPA_1000XHALF | LPA_1000XPAUSE |
++			    LPA_1000XPAUSE_ASYM | LPA_LPACK | LPA_NPAGE |
++			    LPA_SGMII;
++
++	/* The 1000BASE-X duplex capability bits are reserved in SGMII. */
++	return (word & LPA_1000XFULL) && !(word & ~allowed);
++}
++
++u16 cvmx_helper_sgmii_1000x_partner(int ipd_port)
++{
++	int interface = cvmx_helper_get_interface_num(ipd_port);
++	int index = cvmx_helper_get_interface_index_num(ipd_port);
++	union cvmx_pcsx_rxx_sync_reg sync;
++	u16 partner;
++
++	if (cvmx_helper_get_1000x_mode(interface, index))
++		return 0;
++
++	sync.u64 = cvmx_read_csr(CVMX_PCSX_RXX_SYNC_REG(index, interface));
++	if (!sync.s.sync || !sync.s.bit_lock)
++		return 0;
++
++	partner = cvmx_read_csr(CVMX_PCSX_SGMX_LP_ADV_REG(index, interface));
++	return cvmx_helper_sgmii_is_1000x_word(partner) ? partner : 0;
++}
++EXPORT_SYMBOL_GPL(cvmx_helper_sgmii_1000x_partner);
++
++void cvmx_helper_sgmii_set_inband_1000x(int ipd_port, bool enable)
++{
++	int interface = cvmx_helper_get_interface_num(ipd_port);
++	int index = cvmx_helper_get_interface_index_num(ipd_port);
++	union cvmx_pcsx_miscx_ctl_reg misc;
++	union cvmx_gmxx_prtx_cfg gmx;
++	bool enabled;
++
++	if (cvmx_helper_get_1000x_mode(interface, index) == enable)
++		return;
++
++	misc.u64 = cvmx_read_csr(CVMX_PCSX_MISCX_CTL_REG(index, interface));
++	misc.s.gmxeno = 1;
++	cvmx_write_csr(CVMX_PCSX_MISCX_CTL_REG(index, interface), misc.u64);
++	gmx.u64 = cvmx_read_csr(CVMX_GMXX_PRTX_CFG(index, interface));
++	enabled = gmx.s.en;
++
++	cvmx_helper_set_1000x_mode(interface, index, enable);
++	__cvmx_helper_sgmii_hardware_init_one_time(interface, index);
++	cvmx_helper_sgmii_restart_inband(ipd_port, true);
++
++	/* The mode setup disables GMX. Preserve the port's admin state. */
++	gmx.u64 = cvmx_read_csr(CVMX_GMXX_PRTX_CFG(index, interface));
++	gmx.s.en = enabled;
++	cvmx_write_csr(CVMX_GMXX_PRTX_CFG(index, interface), gmx.u64);
++}
++EXPORT_SYMBOL_GPL(cvmx_helper_sgmii_set_inband_1000x);
++
+ static union cvmx_helper_link_info cvmx_helper_sgmii_read_partner(int interface,
+ 								  int index)
+ {
+@@ -515,8 +574,26 @@
+ 	if (!status.s.lnk_st)
+ 		return result;
+ 
++	if (cvmx_helper_get_1000x_mode(interface, index)) {
++		union cvmx_pcsx_anx_lp_abil_reg ability;
++
++		if (!status.s.an_cpt)
++			return result;
++		ability.u64 = cvmx_read_csr(CVMX_PCSX_ANX_LP_ABIL_REG(index, interface));
++		if (!ability.s.fd || ability.s.rem_flt)
++			return result;
++
++		result.s.speed = 1000;
++		result.s.full_duplex = 1;
++		result.s.link_up = 1;
++		return result;
++	}
++
+ 	an.u64 = cvmx_read_csr(CVMX_PCSX_ANX_RESULTS_REG(index, interface));
+ 	partner.u64 = cvmx_read_csr(CVMX_PCSX_SGMX_LP_ADV_REG(index, interface));
++	if (cvmx_helper_sgmii_is_1000x_word(partner.u64))
++		return result;
++
+ 	if (status.s.an_cpt && partner.s.one) {
+ 		if (!partner.s.link)
+ 			return result;
+--- a/drivers/staging/octeon/ethernet.c
++++ b/drivers/staging/octeon/ethernet.c
+@@ -175,6 +175,9 @@
+ 		netdev_info(dev, "SFP module %s, TX_DISABLE=%d\n",
+ 			    present ? "inserted" : "removed", !active);
+ 
++	if (!present && priv->sfp_present > 0)
++		cvmx_helper_sgmii_set_inband_1000x(priv->port, false);
++
+ 	priv->sfp_present = present;
+ 	priv->sfp_active = active;
+ 	priv->sfp_an_attempts = 0;
+@@ -184,13 +187,25 @@
+ 
+ static void cvm_oct_recover_sfp(struct octeon_ethernet *priv)
+ {
+-	if (!priv->sfp_an_retry_at)
++	u16 partner;
++
++	if (!priv->sfp_active)
+ 		return;
+ 	if (netif_carrier_ok(priv->netdev)) {
+ 		priv->sfp_an_retry_at = 0;
+ 		return;
+ 	}
+-	if (time_before(jiffies, priv->sfp_an_retry_at))
++	/* The copper cable can be connected after the initial retries. */
++	partner = cvmx_helper_sgmii_1000x_partner(priv->port);
++	if (partner) {
++		cvmx_helper_sgmii_set_inband_1000x(priv->port, true);
++		netdev_info(priv->netdev, "SFP switched to 1000BASE-X (partner=%#06x)\n",
++			    partner);
++		priv->sfp_an_attempts = 0;
++		priv->sfp_an_retry_at = jiffies + HZ;
++		return;
++	}
++	if (!priv->sfp_an_retry_at || time_before(jiffies, priv->sfp_an_retry_at))
+ 		return;
+ 
+ 	if (priv->sfp_an_attempts == N821_SFP_AN_ATTEMPTS) {

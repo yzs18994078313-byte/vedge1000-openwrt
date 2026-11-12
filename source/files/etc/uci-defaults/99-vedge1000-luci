@@ -1,0 +1,8 @@
+#!/bin/sh
+uci -q batch <<'UCI' || exit 1
+set luci.main.lang=zh_cn
+set luci.themes.Argon=/luci-static/argon
+set luci.main.mediaurlbase=/luci-static/argon
+commit luci
+UCI
+exit 0

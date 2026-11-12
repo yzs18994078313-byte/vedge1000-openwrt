@@ -1,0 +1,335 @@
+--- a/arch/mips/include/asm/octeon/cvmx-helper-sgmii.h
++++ b/arch/mips/include/asm/octeon/cvmx-helper-sgmii.h
+@@ -57,7 +57,8 @@
+  * Returns Zero on success, negative on failure
+  */
+ extern int __cvmx_helper_sgmii_enable(int interface);
+-void cvmx_helper_sgmii_restart_inband(int ipd_port);
++void cvmx_helper_sgmii_restart_inband(int ipd_port, bool hard_reset);
++void cvmx_helper_sgmii_report_inband(int ipd_port, const char *port_name);
+ 
+ /**
+  * Return the link state of an IPD/PKO port as returned by
+--- a/arch/mips/cavium-octeon/executive/cvmx-helper-sgmii.c
++++ b/arch/mips/cavium-octeon/executive/cvmx-helper-sgmii.c
+@@ -251,19 +251,49 @@
+  * Restart negotiation after a module change. Keep GMX gated until
+  * the normal in-band poll reports the new link and programs its speed.
+  */
+-void cvmx_helper_sgmii_restart_inband(int ipd_port)
++void cvmx_helper_sgmii_restart_inband(int ipd_port, bool hard_reset)
+ {
+ 	int interface = cvmx_helper_get_interface_num(ipd_port);
+ 	int index = cvmx_helper_get_interface_index_num(ipd_port);
+ 	union cvmx_pcsx_miscx_ctl_reg misc;
++	union cvmx_pcsx_mrx_control_reg control;
+ 
+ 	misc.u64 = cvmx_read_csr(CVMX_PCSX_MISCX_CTL_REG(index, interface));
+ 	misc.s.gmxeno = 1;
+ 	misc.s.an_ovrd = 0;
+ 	cvmx_write_csr(CVMX_PCSX_MISCX_CTL_REG(index, interface), misc.u64);
+-	__cvmx_helper_sgmii_hardware_init_link(interface, index);
++
++	if (hard_reset) {
++		__cvmx_helper_sgmii_hardware_init_link(interface, index);
++		return;
++	}
++
++	control.u64 = cvmx_read_csr(CVMX_PCSX_MRX_CONTROL_REG(index, interface));
++	control.s.reset = 0;
++	control.s.pwr_dn = 0;
++	control.s.an_en = 1;
++	control.s.rst_an = 1;
++	cvmx_write_csr(CVMX_PCSX_MRX_CONTROL_REG(index, interface), control.u64);
+ }
+ EXPORT_SYMBOL_GPL(cvmx_helper_sgmii_restart_inband);
++
++void cvmx_helper_sgmii_report_inband(int ipd_port, const char *port_name)
++{
++	int interface = cvmx_helper_get_interface_num(ipd_port);
++	int index = cvmx_helper_get_interface_index_num(ipd_port);
++	u64 control = cvmx_read_csr(CVMX_PCSX_MRX_CONTROL_REG(index, interface));
++	u64 misc = cvmx_read_csr(CVMX_PCSX_MISCX_CTL_REG(index, interface));
++	u64 sync = cvmx_read_csr(CVMX_PCSX_RXX_SYNC_REG(index, interface));
++	u64 status, an, partner;
++
++	cvmx_read_csr(CVMX_PCSX_MRX_STATUS_REG(index, interface));
++	status = cvmx_read_csr(CVMX_PCSX_MRX_STATUS_REG(index, interface));
++	an = cvmx_read_csr(CVMX_PCSX_ANX_RESULTS_REG(index, interface));
++	partner = cvmx_read_csr(CVMX_PCSX_SGMX_LP_ADV_REG(index, interface));
++	pr_info("%s: SGMII PCS timeout (%d/%d), ctrl=%#llx misc=%#llx sync=%#llx status=%#llx an=%#llx partner=%#llx\n",
++		port_name, interface, index, control, misc, sync, status, an, partner);
++}
++EXPORT_SYMBOL_GPL(cvmx_helper_sgmii_report_inband);
+ 
+ /**
+  * Configure an SGMII link to the specified speed after the SERTES
+@@ -300,6 +330,9 @@
+ 		cvmx_dprintf
+ 		    ("SGMII%d: Timeout waiting for port %d to be idle\n",
+ 		     interface, index);
++		gmxx_prtx_cfg.s.en = is_enabled;
++		cvmx_write_csr(CVMX_GMXX_PRTX_CFG(index, interface),
++			       gmxx_prtx_cfg.u64);
+ 		return -1;
+ 	}
+ 
+@@ -391,7 +424,7 @@
+ 		int ipd_port = cvmx_helper_get_ipd_port(interface, index);
+ 		__cvmx_helper_sgmii_hardware_init_one_time(interface, index);
+ 		if (cvmx_helper_get_sgmii_inband(interface, index)) {
+-			cvmx_helper_sgmii_restart_inband(ipd_port);
++			cvmx_helper_sgmii_restart_inband(ipd_port, true);
+ 			pr_info("SGMII%d/%d: using PCS in-band link status\n",
+ 				interface, index);
+ 		}
+@@ -471,20 +504,33 @@
+ {
+ 	union cvmx_helper_link_info result = { .u64 = 0 };
+ 	union cvmx_pcsx_mrx_status_reg status;
++	union cvmx_pcsx_anx_results_reg an;
+ 	union cvmx_pcsx_sgmx_lp_adv_reg partner;
++	unsigned int speed;
++	bool full_duplex;
+ 
+ 	/* The link bit is latched low until the first read. */
+ 	cvmx_read_csr(CVMX_PCSX_MRX_STATUS_REG(index, interface));
+ 	status.u64 = cvmx_read_csr(CVMX_PCSX_MRX_STATUS_REG(index, interface));
+-	if (!status.s.lnk_st || !status.s.an_cpt)
++	if (!status.s.lnk_st)
+ 		return result;
+ 
+-	/* In MAC mode the module advertises its link, speed and duplex. */
++	an.u64 = cvmx_read_csr(CVMX_PCSX_ANX_RESULTS_REG(index, interface));
+ 	partner.u64 = cvmx_read_csr(CVMX_PCSX_SGMX_LP_ADV_REG(index, interface));
+-	if (!partner.s.one || !partner.s.link)
++	if (status.s.an_cpt && partner.s.one) {
++		if (!partner.s.link)
++			return result;
++		speed = partner.s.speed;
++		full_duplex = partner.s.dup;
++	} else if (an.s.an_cpt && an.s.link_ok) {
++		/* Use the PCS result when the partner word is unavailable. */
++		speed = an.s.spd;
++		full_duplex = an.s.dup;
++	} else {
+ 		return result;
+-
+-	switch (partner.s.speed) {
++	}
++
++	switch (speed) {
+ 	case 0:
+ 		result.s.speed = 10;
+ 		break;
+@@ -497,7 +543,7 @@
+ 	default:
+ 		return result;
+ 	}
+-	result.s.full_duplex = partner.s.dup;
++	result.s.full_duplex = full_duplex;
+ 	result.s.link_up = 1;
+ 	return result;
+ }
+--- a/drivers/staging/octeon/octeon-ethernet.h
++++ b/drivers/staging/octeon/octeon-ethernet.h
+@@ -74,8 +74,12 @@
+ 	void (*poll)(struct net_device *dev);
+ 	struct delayed_work	port_periodic_work;
+ 	struct device_node	*of_node;
+-	struct gpio_desc *sfp_mod_def0;
+-	int sfp_mod_def0_state;
++	struct regmap *sfp_cpld;
++	unsigned int sfp_mask;
++	int sfp_present;
++	bool sfp_active;
++	unsigned int sfp_an_attempts;
++	unsigned long sfp_an_retry_at;
+ };
+ 
+ struct oct_rx_group {
+--- a/drivers/staging/octeon/ethernet.c
++++ b/drivers/staging/octeon/ethernet.c
+@@ -17,7 +17,10 @@
+ #include <linux/of_net.h>
+ #include <linux/if_ether.h>
+ #include <linux/if_vlan.h>
+-#include <linux/gpio/consumer.h>
++#include <linux/jiffies.h>
++#include <linux/mfd/cisco-n821-cpld.h>
++#include <linux/mfd/syscon.h>
++#include <linux/regmap.h>
+ #include <linux/rtnetlink.h>
+ 
+ #include <net/dst.h>
+@@ -32,6 +35,8 @@
+ #include "ethernet-util.h"
+ 
+ #define OCTEON_MAX_MTU 65392
++#define N821_SFP_TX_DISABLE 0x0c
++#define N821_SFP_AN_ATTEMPTS 3
+ 
+ static int num_packet_buffers = 1024;
+ module_param(num_packet_buffers, int, 0444);
+@@ -124,45 +129,78 @@
+ 		schedule_delayed_work(&plat->rx_refill_work, HZ);
+ }
+ 
++static void cvm_oct_init_sfp(struct octeon_ethernet *priv)
++{
++	struct regmap *cpld;
++	unsigned int bit;
++
++	if (!of_property_present(priv->of_node, "cisco,sfp-cpld"))
++		return;
++
++	cpld = syscon_regmap_lookup_by_phandle_args(priv->of_node,
++						    "cisco,sfp-cpld", 1, &bit);
++	if (IS_ERR(cpld) || bit >= 8) {
++		netdev_warn(priv->netdev, "cannot map SFP CPLD control\n");
++		return;
++	}
++	priv->sfp_cpld = cpld;
++	priv->sfp_mask = BIT(bit);
++	priv->sfp_present = -1;
++}
++
+ static void cvm_oct_poll_sfp(struct octeon_ethernet *priv)
+ {
+ 	struct net_device *dev = priv->netdev;
+-	struct gpio_desc *mod_def0 = priv->sfp_mod_def0;
+-	int old_state = priv->sfp_mod_def0_state;
+-	int state;
+-
+-	if (IS_ERR(mod_def0)) {
+-		/* The CPLD GPIO provider is loaded after this built-in driver. */
+-		mod_def0 = fwnode_gpiod_get_index(of_fwnode_handle(priv->of_node),
+-						 "mod-def0", 0, GPIOD_IN,
+-						 dev->name);
+-		if (IS_ERR(mod_def0)) {
+-			if (PTR_ERR(mod_def0) != -EPROBE_DEFER) {
+-				netdev_warn(dev, "SFP presence GPIO unavailable: %ld\n",
+-					    PTR_ERR(mod_def0));
+-				priv->sfp_mod_def0 = NULL;
+-			}
+-			return;
+-		}
+-		priv->sfp_mod_def0 = mod_def0;
+-	}
+-
+-	/* Either edge invalidates the old PCS state. */
+-	state = gpiod_get_raw_value_cansleep(mod_def0);
+-	if (state < 0 || state == old_state)
++	unsigned int value;
++	bool present, active;
++	int ret;
++
++	ret = regmap_read(priv->sfp_cpld, N821_CPLD_REG_SFP_PRSNT, &value);
++	if (ret)
+ 		return;
+-	priv->sfp_mod_def0_state = state;
+-
+-	/* Preserve a working cold-boot link when the GPIO first becomes ready. */
+-	if (old_state < 0 && cvmx_helper_link_get(priv->port).s.link_up)
++	present = value & priv->sfp_mask;
++	active = present && netif_running(dev);
++	if (present == priv->sfp_present && active == priv->sfp_active)
+ 		return;
+-	if (old_state >= 0)
+-		netdev_info(dev, "SFP cage signal %d -> %d, restarting SGMII\n",
+-			    old_state, state);
+-
+-	priv->link_info = 0;
+-	netif_carrier_off(dev);
+-	cvmx_helper_sgmii_restart_inband(priv->port);
++
++	ret = regmap_update_bits(priv->sfp_cpld, N821_SFP_TX_DISABLE,
++				 priv->sfp_mask, active ? 0 : priv->sfp_mask);
++	if (ret) {
++		if (net_ratelimit())
++			netdev_warn(dev, "SFP TX_DISABLE update failed: %d\n", ret);
++		return;
++	}
++
++	if (present != priv->sfp_present && (present || priv->sfp_present >= 0))
++		netdev_info(dev, "SFP module %s, TX_DISABLE=%d\n",
++			    present ? "inserted" : "removed", !active);
++
++	priv->sfp_present = present;
++	priv->sfp_active = active;
++	priv->sfp_an_attempts = 0;
++	/* Wait for the module to initialize before intervening in negotiation. */
++	priv->sfp_an_retry_at = active ? jiffies + HZ : 0;
++}
++
++static void cvm_oct_recover_sfp(struct octeon_ethernet *priv)
++{
++	if (!priv->sfp_an_retry_at)
++		return;
++	if (netif_carrier_ok(priv->netdev)) {
++		priv->sfp_an_retry_at = 0;
++		return;
++	}
++	if (time_before(jiffies, priv->sfp_an_retry_at))
++		return;
++
++	if (priv->sfp_an_attempts == N821_SFP_AN_ATTEMPTS) {
++		cvmx_helper_sgmii_report_inband(priv->port, priv->netdev->name);
++		priv->sfp_an_retry_at = 0;
++		return;
++	}
++	cvmx_helper_sgmii_restart_inband(priv->port, priv->sfp_an_attempts != 0);
++	priv->sfp_an_attempts++;
++	priv->sfp_an_retry_at = jiffies + 2 * HZ;
+ }
+ 
+ static void cvm_oct_periodic_worker(struct work_struct *work)
+@@ -171,12 +209,13 @@
+ 						    struct octeon_ethernet,
+ 						    port_periodic_work.work);
+ 
+-	if (priv->sfp_mod_def0) {
++	if (priv->sfp_cpld) {
+ 		/* Serialize PCS changes with ndo_open() and ndo_stop(). */
+ 		if (rtnl_trylock()) {
+ 			cvm_oct_poll_sfp(priv);
+ 			if (priv->poll)
+ 				priv->poll(priv->netdev);
++			cvm_oct_recover_sfp(priv);
+ 			rtnl_unlock();
+ 		}
+ 	} else if (priv->poll) {
+@@ -505,10 +544,6 @@
+ 
+ void cvm_oct_common_uninit(struct net_device *dev)
+ {
+-	struct octeon_ethernet *priv = netdev_priv(dev);
+-
+-	if (!IS_ERR_OR_NULL(priv->sfp_mod_def0))
+-		gpiod_put(priv->sfp_mod_def0);
+ 	if (dev->phydev)
+ 		phy_disconnect(dev->phydev);
+ }
+@@ -567,7 +602,9 @@
+ 	union cvmx_helper_link_info link_info;
+ 
+ 	if (cvm_oct_uses_sgmii_inband(priv)) {
+-		link_info = cvmx_helper_link_get(priv->port);
++		link_info.u64 = 0;
++		if (!priv->sfp_cpld || priv->sfp_present != 0)
++			link_info = cvmx_helper_link_get(priv->port);
+ 	} else {
+ 		link_info.u64 = 0;
+ 		link_info.s.link_up = 1;
+@@ -1081,10 +1118,7 @@
+ 			}
+ 
+ 			if (cvm_oct_uses_sgmii_inband(priv)) {
+-				if (of_property_present(priv->of_node, "mod-def0-gpios")) {
+-					priv->sfp_mod_def0 = ERR_PTR(-EPROBE_DEFER);
+-					priv->sfp_mod_def0_state = -1;
+-				}
++				cvm_oct_init_sfp(priv);
+ 				netif_carrier_off(dev);
+ 			} else if (priv->of_node &&
+ 				   of_phy_is_fixed_link(priv->of_node)) {

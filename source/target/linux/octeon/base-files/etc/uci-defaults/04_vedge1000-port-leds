@@ -1,0 +1,47 @@
+#!/bin/sh
+
+. /lib/functions.sh
+
+[ "$(board_name)" = "cisco,vedge1000" ] || exit 0
+
+# Older images used invalid UCI section names for the SFP LEDs.
+# Add settings for LEDs that do not already have a user configuration.
+configured_leds=
+remember_led() {
+	local sysfs
+	config_get sysfs "$1" sysfs
+	configured_leds="$configured_leds $sysfs "
+}
+
+config_load system
+config_foreach remember_led led
+
+for port in lan0 lan1 lan2 lan3 lan4 lan5 lan6 lan7; do
+	case "$configured_leds" in
+		*" $port:green:status "*) ;;
+		*)
+			section=$(uci add system led) || exit 1
+			uci batch <<-EOF || exit 1
+				set system.$section.name='$port link/activity'
+				set system.$section.trigger='netdev'
+				set system.$section.dev='$port'
+				set system.$section.mode='link tx rx'
+				set system.$section.sysfs='$port:green:status'
+			EOF
+			;;
+	esac
+	case "$configured_leds" in
+		*" $port:green:activity "*) ;;
+		*)
+			section=$(uci add system led) || exit 1
+			uci batch <<-EOF || exit 1
+				set system.$section.name='$port auxiliary'
+				set system.$section.trigger='none'
+				set system.$section.default='0'
+				set system.$section.sysfs='$port:green:activity'
+			EOF
+			;;
+	esac
+done
+
+uci commit system

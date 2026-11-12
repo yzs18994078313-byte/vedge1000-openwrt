@@ -1,0 +1,20 @@
+#
+# Copyright (C) 2023 OpenWrt.org
+#
+
+. /lib/functions/uci-defaults.sh
+
+board_config_update
+
+case "$(board_name)" in
+cisco,vedge1000)
+	for port in lan0 lan1 lan2 lan3 lan4 lan5 lan6 lan7; do
+		ucidef_set_led_netdev "${port}_link" "$port link/activity" "$port:green:status" "$port" "link tx rx"
+		ucidef_set_led_default "${port}_act" "$port auxiliary" "$port:green:activity" "0"
+	done
+	;;
+esac
+
+board_config_flush
+
+exit 0

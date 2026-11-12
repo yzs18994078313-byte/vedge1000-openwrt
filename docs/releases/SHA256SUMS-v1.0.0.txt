@@ -1,0 +1,4 @@
+78c06221643cf889afc5d031cdf8a245f63579f222f9ea2bc629cebd7e07389a  openwrt-25.12.6-vedge1000-sfp-eeprom-mode-argon-openclash-squashfs-sysupgrade.tar
+40de9eaf585fc21637f0562cde9cc69aec556cb71cd450f5ab320ec901efc316  openwrt-25.12.6-vedge1000-sfp-eeprom-mode-argon-openclash-initramfs-kernel.bin
+7397ce2104c4fe7c49b203c39af4ea0cbb9731120e4770c49648c7d2d1223168  openwrt-25.12.6-vedge1000-sfp-eeprom-mode-argon-openclash.manifest.txt
+cbb3c33ed347b04f5772817c8499a2554bb466973c0ec85f768b2b89245f6993  openwrt-25.12.6-vedge1000-sfp-eeprom-mode-source.tar.zst

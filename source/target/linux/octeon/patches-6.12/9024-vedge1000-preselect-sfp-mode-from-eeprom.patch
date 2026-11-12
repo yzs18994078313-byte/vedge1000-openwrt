@@ -1,0 +1,222 @@
+--- a/arch/mips/include/asm/octeon/cvmx-helper-sgmii.h
++++ b/arch/mips/include/asm/octeon/cvmx-helper-sgmii.h
+@@ -59,7 +59,7 @@
+ extern int __cvmx_helper_sgmii_enable(int interface);
+ void cvmx_helper_sgmii_restart_inband(int ipd_port, bool hard_reset);
+ void cvmx_helper_sgmii_report_inband(int ipd_port, const char *port_name);
+-u16 cvmx_helper_sgmii_1000x_partner(int ipd_port);
++u16 cvmx_helper_sgmii_alternate_partner(int ipd_port, bool *use_1000x);
+ void cvmx_helper_sgmii_set_inband_1000x(int ipd_port, bool enable);
+ 
+ /**
+--- a/arch/mips/cavium-octeon/executive/cvmx-helper-sgmii.c
++++ b/arch/mips/cavium-octeon/executive/cvmx-helper-sgmii.c
+@@ -511,24 +511,42 @@
+ 	return (word & LPA_1000XFULL) && !(word & ~allowed);
+ }
+ 
+-u16 cvmx_helper_sgmii_1000x_partner(int ipd_port)
++static bool cvmx_helper_sgmii_is_link_word(u16 word)
++{
++	const u16 required = LPA_SGMII | LPA_SGMII_LINK;
++	const u16 allowed = required | LPA_LPACK | LPA_SGMII_DPX_SPD_MASK;
++
++	return (word & required) == required && !(word & ~allowed) &&
++	       (word & LPA_SGMII_SPD_MASK) != LPA_SGMII_SPD_MASK;
++}
++
++u16 cvmx_helper_sgmii_alternate_partner(int ipd_port, bool *use_1000x)
+ {
+ 	int interface = cvmx_helper_get_interface_num(ipd_port);
+ 	int index = cvmx_helper_get_interface_index_num(ipd_port);
+ 	union cvmx_pcsx_rxx_sync_reg sync;
++	bool current_1000x;
+ 	u16 partner;
+-
+-	if (cvmx_helper_get_1000x_mode(interface, index))
+-		return 0;
+ 
+ 	sync.u64 = cvmx_read_csr(CVMX_PCSX_RXX_SYNC_REG(index, interface));
+ 	if (!sync.s.sync || !sync.s.bit_lock)
+ 		return 0;
+ 
+-	partner = cvmx_read_csr(CVMX_PCSX_SGMX_LP_ADV_REG(index, interface));
+-	return cvmx_helper_sgmii_is_1000x_word(partner) ? partner : 0;
+-}
+-EXPORT_SYMBOL_GPL(cvmx_helper_sgmii_1000x_partner);
++	current_1000x = cvmx_helper_get_1000x_mode(interface, index);
++	if (current_1000x) {
++		partner = cvmx_read_csr(CVMX_PCSX_ANX_LP_ABIL_REG(index, interface));
++		if (!cvmx_helper_sgmii_is_link_word(partner))
++			return 0;
++	} else {
++		partner = cvmx_read_csr(CVMX_PCSX_SGMX_LP_ADV_REG(index, interface));
++		if (!cvmx_helper_sgmii_is_1000x_word(partner))
++			return 0;
++	}
++
++	*use_1000x = !current_1000x;
++	return partner;
++}
++EXPORT_SYMBOL_GPL(cvmx_helper_sgmii_alternate_partner);
+ 
+ void cvmx_helper_sgmii_set_inband_1000x(int ipd_port, bool enable)
+ {
+--- a/drivers/staging/octeon/octeon-ethernet.h
++++ b/drivers/staging/octeon/octeon-ethernet.h
+@@ -79,6 +79,7 @@
+ 	int sfp_present;
+ 	bool sfp_active;
+ 	unsigned int sfp_an_attempts;
++	unsigned int sfp_eeprom_tries;
+ 	unsigned long sfp_an_retry_at;
+ };
+ 
+--- a/drivers/staging/octeon/ethernet.c
++++ b/drivers/staging/octeon/ethernet.c
+@@ -17,10 +17,12 @@
+ #include <linux/of_net.h>
+ #include <linux/if_ether.h>
+ #include <linux/if_vlan.h>
++#include <linux/i2c.h>
+ #include <linux/jiffies.h>
+ #include <linux/mfd/cisco-n821-cpld.h>
+ #include <linux/mfd/syscon.h>
+ #include <linux/regmap.h>
++#include <linux/sfp.h>
+ #include <linux/rtnetlink.h>
+ 
+ #include <net/dst.h>
+@@ -37,6 +39,8 @@
+ #define OCTEON_MAX_MTU 65392
+ #define N821_SFP_TX_DISABLE 0x0c
+ #define N821_SFP_AN_ATTEMPTS 3
++#define N821_SFP_EEPROM_ADDR 0x50
++#define N821_SFP_EEPROM_ATTEMPTS 3
+ 
+ static int num_packet_buffers = 1024;
+ module_param(num_packet_buffers, int, 0444);
+@@ -178,6 +182,9 @@
+ 	if (!present && priv->sfp_present > 0)
+ 		cvmx_helper_sgmii_set_inband_1000x(priv->port, false);
+ 
++	if (present != priv->sfp_present)
++		priv->sfp_eeprom_tries = present ? N821_SFP_EEPROM_ATTEMPTS : 0;
++
+ 	priv->sfp_present = present;
+ 	priv->sfp_active = active;
+ 	priv->sfp_an_attempts = 0;
+@@ -185,9 +192,89 @@
+ 	priv->sfp_an_retry_at = active ? jiffies + HZ : 0;
+ }
+ 
++static int cvm_oct_read_sfp_id(struct i2c_adapter *adapter,
++			       struct sfp_eeprom_base *id)
++{
++	u8 *bytes = (u8 *)id;
++	u8 offset, sum = 0;
++	size_t i;
++	int ret;
++
++	/* The N821 I2C controller accepts at most three bytes per message. */
++	for (offset = 0; offset < sizeof(*id); offset += 2) {
++		struct i2c_msg msgs[] = {
++			{ .addr = N821_SFP_EEPROM_ADDR, .len = 1, .buf = &offset },
++			{ .addr = N821_SFP_EEPROM_ADDR, .flags = I2C_M_RD,
++			  .len = 2, .buf = bytes + offset },
++		};
++
++		ret = i2c_transfer(adapter, msgs, ARRAY_SIZE(msgs));
++		if (ret != 2)
++			return ret < 0 ? ret : -EIO;
++	}
++	for (i = 0; i < offsetof(struct sfp_eeprom_base, cc_base); i++)
++		sum += bytes[i];
++
++	return sum == id->cc_base ? 0 : -EBADMSG;
++}
++
++static bool cvm_oct_sfp_id_matches(const char field[16], const char *expected)
++{
++	size_t len = 16;
++
++	while (len && (field[len - 1] == ' ' || field[len - 1] == '\0'))
++		len--;
++
++	return len == strlen(expected) && !memcmp(field, expected, len);
++}
++
++static void cvm_oct_preselect_sfp_mode(struct octeon_ethernet *priv)
++{
++	struct sfp_eeprom_base id;
++	struct i2c_adapter *adapter;
++	struct device_node *bus;
++	int ret;
++
++	if (!IS_REACHABLE(CONFIG_I2C) || !priv->sfp_eeprom_tries)
++		return;
++	if (netif_carrier_ok(priv->netdev)) {
++		priv->sfp_eeprom_tries = 0;
++		return;
++	}
++
++	bus = of_parse_phandle(priv->of_node, "cisco,sfp-i2c-bus", 0);
++	if (!bus) {
++		priv->sfp_eeprom_tries = 0;
++		return;
++	}
++	adapter = of_get_i2c_adapter_by_node(bus);
++	of_node_put(bus);
++	if (!adapter)
++		return;
++
++	priv->sfp_eeprom_tries--;
++	ret = cvm_oct_read_sfp_id(adapter, &id);
++	i2c_put_adapter(adapter);
++	if (ret)
++		return;
++	priv->sfp_eeprom_tries = 0;
++
++	/* This module's host side uses Clause 37, even though it is RJ45. */
++	if (id.phys_id != SFF8024_ID_SFP ||
++	    !cvm_oct_sfp_id_matches(id.vendor_name, "OEM") ||
++	    !cvm_oct_sfp_id_matches(id.vendor_pn, "SFP-GE-T"))
++		return;
++
++	cvmx_helper_sgmii_set_inband_1000x(priv->port, true);
++	priv->sfp_an_attempts = 0;
++	priv->sfp_an_retry_at = priv->sfp_active ? jiffies + HZ : 0;
++	netdev_info(priv->netdev, "SFP EEPROM OEM SFP-GE-T: preselected 1000BASE-X\n");
++}
++
+ static void cvm_oct_recover_sfp(struct octeon_ethernet *priv)
+ {
+ 	u16 partner;
++	bool use_1000x;
+ 
+ 	if (!priv->sfp_active)
+ 		return;
+@@ -196,11 +283,11 @@
+ 		return;
+ 	}
+ 	/* The copper cable can be connected after the initial retries. */
+-	partner = cvmx_helper_sgmii_1000x_partner(priv->port);
++	partner = cvmx_helper_sgmii_alternate_partner(priv->port, &use_1000x);
+ 	if (partner) {
+-		cvmx_helper_sgmii_set_inband_1000x(priv->port, true);
+-		netdev_info(priv->netdev, "SFP switched to 1000BASE-X (partner=%#06x)\n",
+-			    partner);
++		cvmx_helper_sgmii_set_inband_1000x(priv->port, use_1000x);
++		netdev_info(priv->netdev, "SFP switched to %s (partner=%#06x)\n",
++			    use_1000x ? "1000BASE-X" : "SGMII", partner);
+ 		priv->sfp_an_attempts = 0;
+ 		priv->sfp_an_retry_at = jiffies + HZ;
+ 		return;
+@@ -230,6 +317,7 @@
+ 			cvm_oct_poll_sfp(priv);
+ 			if (priv->poll)
+ 				priv->poll(priv->netdev);
++			cvm_oct_preselect_sfp_mode(priv);
+ 			cvm_oct_recover_sfp(priv);
+ 			rtnl_unlock();
+ 		}
