@@ -1,0 +1,3 @@
+case "${ACTION:-}" in
+	add) [ -z "${DEVNAME:-}" ] || /usr/libexec/vedge-usb-automount "$DEVNAME" ;;
+esac

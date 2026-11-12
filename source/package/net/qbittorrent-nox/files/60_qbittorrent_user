@@ -1,0 +1,7 @@
+#!/bin/sh
+
+. /lib/functions.sh
+
+# A configuration backup can replace /etc/passwd and /etc/group on upgrade.
+add_group_and_user qbittorrent-nox
+user_exists qbittorrent && group_exists qbittorrent

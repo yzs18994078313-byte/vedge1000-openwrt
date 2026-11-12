@@ -1,0 +1,25 @@
+Use the packaged DB-IP Country Lite data if there is no readable profile copy.
+The upstream update path still writes to the profile.
+
+--- a/src/base/net/geoipmanager.cpp
++++ b/src/base/net/geoipmanager.cpp
+@@ -91,6 +91,8 @@
+ 
+     QString error;
+     m_geoIPDatabase = GeoIPDatabase::load(filepath, error);
++    if (!m_geoIPDatabase)
++        m_geoIPDatabase = GeoIPDatabase::load(Path(u"/usr/share/qbittorrent/dbip-country-lite.mmdb"_s), error);
+     if (m_geoIPDatabase)
+     {
+         LogMsg(tr("IP geolocation database loaded. Type: %1. Build time: %2.")
+--- a/src/webui/www/private/index.html
++++ b/src/webui/www/private/index.html
+@@ -310,6 +310,8 @@
+             <table style="margin-right: 5px; margin-left: auto; width: max-content;">
+                 <tbody>
+                     <tr>
++                        <td><a href="https://db-ip.com" target="_blank" rel="noopener noreferrer">IP Geolocation by DB-IP</a></td>
++                        <td class="statusBarSeparator"></td>
+                         <td id="freeSpaceOnDisk"></td>
+                         <td class="statusBarSeparator invisible"></td>
+                         <td id="externalIPs" class="invisible"></td>

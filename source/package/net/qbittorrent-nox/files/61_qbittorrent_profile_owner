@@ -1,0 +1,10 @@
+#!/bin/sh
+
+[ -z "${IPKG_INSTROOT:-}" ] || exit 0
+profile=/etc/qBittorrent
+[ -d "$profile" ] && [ ! -L "$profile" ] || exit 0
+id qbittorrent >/dev/null 2>&1 || exit 1
+pidof qbittorrent-nox >/dev/null && exit 1
+
+# sysupgrade archives profile files, so restored parent directories can be root-owned.
+find "$profile" -xdev -type d -exec chown -h qbittorrent:qbittorrent {} +

@@ -1,0 +1,4 @@
+435331ff10aac4ed5c67b1426a2ab061bd8ff14d3539af4551ec99458217c014  openwrt-25.12.6-vedge1000-qbittorrent-http-downloads-squashfs-sysupgrade.tar
+77e2b91929eb4c4184b4f8169e50625e33d6066d17f6dade7d1d0ebb403e6928  openwrt-25.12.6-vedge1000-qbittorrent-http-downloads.manifest.txt
+4051465f0255ec438303edc9c73e50099f83b76b1c5fff0bfd81f4d1264f4ce7  openwrt-25.12.6-vedge1000-qbittorrent-http-downloads-apk-bundle.tar.gz
+7ceb93b07bf713d30a31f1ce36f4f2740d7598fd87d0d3130faa3576e5b75d6c  vedge1000-25.12.6-http-r8-20261112-source.tar.zst

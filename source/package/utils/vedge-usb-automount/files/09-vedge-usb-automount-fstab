@@ -1,0 +1,17 @@
+#!/bin/sh
+
+. /lib/functions.sh
+
+[ "$(board_name)" = cisco,vedge1000 ] || exit 0
+[ ! -e /etc/config/fstab ] && [ ! -L /etc/config/fstab ] || exit 0
+
+# Keep fstools defaults without pre-creating disabled entries for attached disks.
+cat > /etc/config/fstab <<'EOF'
+config global
+	option anon_swap '0'
+	option anon_mount '0'
+	option auto_swap '1'
+	option auto_mount '1'
+	option delay_root '5'
+	option check_fs '0'
+EOF

@@ -1,0 +1,125 @@
+#!/bin/sh
+
+. /lib/functions.sh
+
+disk_path() {
+	local path="$1"
+	[ ! -f "$path/partition" ] || path="${path%/*}"
+	printf '%s\n' "$path"
+}
+
+root_directory() {
+	[ -d "$1" ] && [ ! -L "$1" ] &&
+		ls -ldn "$1" | awk '$3 == 0 && substr($1,6,1) != "w" && substr($1,9,1) != "w" { good=1 }
+			END { exit !good }'
+}
+
+fstab_entry() {
+	local key_uuid key_label key_device key_target
+	config_get key_uuid "$1" uuid
+	config_get key_label "$1" label
+	config_get key_device "$1" device
+	config_get key_target "$1" target
+	if [ "$key_target" = "$target" ] ||
+	   { [ -n "$key_uuid" ] && [ "$(printf '%s' "$key_uuid" | tr 'A-F' 'a-f')" = "$uuid" ]; } ||
+	   { [ -z "$key_uuid" ] && [ -n "$key_label" ] && [ "$key_label" = "$label" ]; } ||
+	   { [ -z "$key_uuid$key_label" ] && [ "${key_device##*/}" = "$name" ]; }; then
+		configured=1
+	fi
+}
+
+mount_disk() {
+	local name="$1" device path disk partition id root_id root_path fs uuid label
+	local target configured=0 options uid gid created=0
+	case "$name" in
+		sd[a-z]*) ;;
+		*) return 0 ;;
+	esac
+	case "$name" in *[!a-z0-9]*) return 0 ;; esac
+	device="/dev/$name"
+	[ -e "$device" ] || return 0
+	path=$(readlink -f "/sys/class/block/$name") || return 0
+	case "$path" in
+		*/16f0000000000.ehci/*) return 0 ;;
+		*/usb[0-9]*/*/block/*) ;;
+		*) return 0 ;;
+	esac
+	if [ ! -f "$path/partition" ]; then
+		for partition in "$path"/*/partition; do
+			[ ! -f "$partition" ] || return 0
+		done
+	fi
+	read -r id < "$path/dev" || return 0
+	# Preserve mounts already handled by fstab or DiskMan.
+	awk -v id="$id" -v dev="$device" '
+		$3 == id { found=1 }
+		{ for (i=7; i<NF; ++i) if ($i=="-" && $(i+2)==dev) found=1 }
+		END { exit !found }
+	' /proc/self/mountinfo && return 0
+
+	disk=$(disk_path "$path")
+	for root_id in $(awk '$5=="/" || $5=="/rom" || $5=="/overlay" || $5=="/boot" { print $3 }' /proc/self/mountinfo); do
+		root_path=$(readlink -f "/sys/dev/block/$root_id") || continue
+		[ "$(disk_path "$root_path")" != "$disk" ] || return 0
+	done
+
+	fs=$(blkid -p -s TYPE -o value "$device" 2>/dev/null) || return 0
+	options=rw,noatime,nodev,nosuid,noexec
+	case "$fs" in
+		ext2|ext3|ext4) fs=ext4 ;;
+		exfat|vfat)
+			uid=$(id -u qbittorrent) && gid=$(id -g qbittorrent) || return 0
+			options="$options,uid=$uid,gid=$gid,fmask=0133,dmask=0000"
+			;;
+		*) return 0 ;;
+	esac
+	uuid=$(blkid -p -s UUID -o value "$device" 2>/dev/null) || return 0
+	case "$uuid" in ''|*[!0-9A-Fa-f-]*) return 0 ;; esac
+	uuid=$(printf '%s' "$uuid" | tr 'A-F' 'a-f')
+	label=$(blkid -p -s LABEL -o value "$device" 2>/dev/null) || label=
+	target="/mnt/usb-$uuid"
+	config_foreach fstab_entry mount
+	[ "$configured" = 0 ] || return 0
+	awk -v target="$target" '$5 == target {found=1} END {exit !found}' /proc/self/mountinfo && return 0
+
+	[ ! -L /mnt ] && mkdir -p -m 0755 /mnt && root_directory /mnt || return 1
+	# An unmounted target must not hide existing files.
+	if [ -e "$target" ] || [ -L "$target" ]; then
+		root_directory "$target" && [ -z "$(ls -A "$target")" ] || return 0
+	else
+		mkdir -m 0755 "$target" || return 1
+		created=1
+	fi
+	if mount -t "$fs" -o "$options" "$device" "$target"; then
+		if [ "$fs" = ext4 ] && ! (
+			cd "$target" &&
+				awk -v id="$id" -v target="$target" '
+					$3 == id && $5 == target {found=1}
+					END {exit !found}
+				' /proc/self/mountinfo &&
+				chmod 00777 .
+		); then
+			logger -t vedge-usb-automount "Could not set directory permissions on $target"
+		fi
+		logger -t vedge-usb-automount "Mounted $device at $target"
+	else
+		[ "$created" = 0 ] || rmdir "$target"
+		logger -t vedge-usb-automount "Could not mount $device at $target"
+		return 1
+	fi
+}
+
+[ "$(board_name)" = cisco,vedge1000 ] || exit 0
+mkdir -p /var/lock || exit 1
+exec 9>/var/lock/vedge-usb-automount.lock
+flock -x 9 || exit 1
+config_load fstab || :
+
+if [ "$#" -eq 1 ]; then
+	mount_disk "$1"
+else
+	for entry in /sys/class/block/sd*; do
+		[ -e "$entry" ] || continue
+		mount_disk "${entry##*/}" || :
+	done
+fi

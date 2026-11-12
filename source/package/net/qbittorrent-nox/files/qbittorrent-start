@@ -1,0 +1,47 @@
+#!/bin/sh
+
+set -eu
+umask 077
+
+port=$1
+address=$2
+settings=/etc/qBittorrent/config/qBittorrent.conf
+
+mkdir -p "${settings%/*}"
+temporary=$(mktemp "${settings%/*}/.qbittorrent.XXXXXXXX")
+trap 'rm -f "$temporary"' EXIT
+if [ -f "$settings" ]; then
+	QBT_WEBUI_ADDRESS="$address" awk '
+		BEGIN {
+			keys["[Application]"] = "FileLogger\\Path"
+			values["[Application]"] = "/var/log/qbittorrent"
+			keys["[WebUI]"] = "Address"
+			values["[WebUI]"] = ENVIRON["QBT_WEBUI_ADDRESS"]
+		}
+		/^\[[^]]+\]$/ {
+			section = $0
+			print
+			if (section in keys) {
+				print keys[section] "=" values[section]
+				seen[section] = 1
+			}
+			next
+		}
+		!(section in keys) || index($0, keys[section] "=") != 1 { print }
+		END {
+			for (section in keys)
+				if (!(section in seen))
+					print "\n" section "\n" keys[section] "=" values[section]
+		}
+	' "$settings" > "$temporary"
+else
+	{
+		printf '[Application]\nFileLogger\\Path=/var/log/qbittorrent\n\n'
+		printf '[BitTorrent]\nSession\\UPnP=false\n'
+		printf '\n[WebUI]\nAddress=%s\nLocalHostAuth=true\n' "$address"
+	} > "$temporary"
+fi
+mv "$temporary" "$settings"
+trap - EXIT
+
+exec /usr/bin/qbittorrent-nox --profile=/etc --webui-port="$port" --confirm-legal-notice

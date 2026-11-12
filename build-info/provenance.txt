@@ -1,0 +1,18 @@
+baseline=vedge1000-25.12.6-http-r8-20261112
+device=cisco,vedge1000
+firmware=OpenWrt 25.12.6 r33311-981c978eff
+qbittorrent=5.3.0-r8
+build_host_arch=x86_64
+build_host_os="Ubuntu 26.04.1 LTS"
+source=64900e756efa667774214f9c6b17c113222e01f7
+source/feeds/packages=093d551675b1119a06ef224d419905e8d6b2af1a
+source/feeds/luci=75a306df84a020c57a631ef5b4c02ace56d93387
+755 source/package/base-files/files/bin
+755 source/package/base-files/files/etc
+755 source/package/base-files/files/lib
+755 source/package/base-files/files/sbin
+644 source/package/base-files/files/etc/passwd
+ae115a7fbb024cdc3410612ddeb733f208cef612a4699ae8f9bf1d28d76a349b  source/.config
+8b2da9de34693b9c89b89c4874a7d5ee844e313c97240be142db0bd0d1dbf41c  source/files/etc/openclash/core/clash_meta
+3ca3eb87e10e1a918af09f09e8fc35c12b4611ea50814084fb3fb36baefd40d1  source/target/linux/octeon/base-files/etc/uci-defaults/04_vedge1000-port-leds
+435331ff10aac4ed5c67b1426a2ab061bd8ff14d3539af4551ec99458217c014  deliver/openwrt-25.12.6-vedge1000-qbittorrent-http-downloads-squashfs-sysupgrade.tar

@@ -1,0 +1,828 @@
+Expose authenticated HTTP streaming for readable external USB volumes.
+Pass an already-open file to the existing ranged HTTP sender to keep
+downloads confined to the validated volume even when files are renamed.
+
+--- a/src/base/http/asyncfilesender.cpp
++++ b/src/base/http/asyncfilesender.cpp
+@@ -48,8 +48,8 @@
+ 
+ using namespace Qt::StringLiterals;
+ 
+-const qint64 CHUNK_SIZE = 256 * 1024;
+-const qint64 MAX_BUFFER_SIZE = 1024 * 1024;
++const qint64 CHUNK_SIZE = 512 * 1024;
++const qint64 MAX_BUFFER_SIZE = 2 * 1024 * 1024;
+ 
+ namespace
+ {
+@@ -92,7 +92,10 @@
+             return;
+         }
+ 
+-        m_buffer.append(data);
++        if (m_buffer.isEmpty())
++            m_buffer = data;
++        else
++            m_buffer.append(data);
+         m_isClosed = close;
+ 
+         if (!m_hasNewData)
+@@ -131,8 +134,9 @@
+ 
+ public:
+     Worker(const Path &filePath, const Request &request, const HeaderMap &responseHeaders
+-           , std::shared_ptr<DataPipe> dataPipe)
++           , std::shared_ptr<DataPipe> dataPipe, std::shared_ptr<QFile> file)
+         : m_filePath {filePath}
++        , m_file {std::move(file)}
+         , m_request {request}
+         , m_responseHeaders {responseHeaders}
+         , m_dataPipe {std::move(dataPipe)}
+@@ -216,9 +220,10 @@
+             rangeRequest = parseRangeResult;
+         }
+ 
+-        QFile file {m_filePath.data()};
+-
+-        if (!file.open(QIODevice::ReadOnly))
++        QFile pathFile {m_filePath.data()};
++        QFile &file = m_file ? *m_file : pathFile;
++
++        if (!file.isOpen() && !file.open(QIODevice::ReadOnly))
+         {
+             const QByteArray data = serializeResponse(
+                     {.status = {.code = 500, .text = u"Internal Server Error"_s}, .content = file.errorString().toUtf8()}
+@@ -242,8 +247,10 @@
+ 
+         m_responseHeaders.insert(HEADER_CONTENT_LENGTH, QString::number(remainingSize));
+         m_responseHeaders.insert(HEADER_ACCEPT_RANGES, u"bytes"_s);
+-        m_responseHeaders.insert(HEADER_CONTENT_TYPE, QMimeDatabase().mimeTypeForFile(m_filePath.data()).name());
+-        m_responseHeaders.insert(HEADER_CONTENT_DISPOSITION, u"attachment; filename=\"%1\""_s.arg(m_filePath.filename()));
++        if (!m_responseHeaders.contains(HEADER_CONTENT_TYPE))
++            m_responseHeaders.insert(HEADER_CONTENT_TYPE, QMimeDatabase().mimeTypeForFile(m_filePath.data()).name());
++        if (!m_responseHeaders.contains(HEADER_CONTENT_DISPOSITION))
++            m_responseHeaders.insert(HEADER_CONTENT_DISPOSITION, u"attachment; filename=\"%1\""_s.arg(m_filePath.filename()));
+ 
+         const QByteArray headData = serializeResponseHead(responseStatus, m_responseHeaders);
+         if (m_request.method == HEADER_REQUEST_METHOD_HEAD)
+@@ -267,16 +274,18 @@
+     }
+ 
+     Path m_filePath;
++    std::shared_ptr<QFile> m_file;
+     Request m_request;
+     HeaderMap m_responseHeaders;
+     std::shared_ptr<DataPipe> m_dataPipe;
+ };
+ 
+ Http::AsyncFileSender::AsyncFileSender(const Request &request, const Path &filePath
+-        , const HeaderMap &headers, QAbstractSocket *socket, QObject *parent)
++        , const HeaderMap &headers, QAbstractSocket *socket, std::shared_ptr<QFile> file, QObject *parent)
+     : QObject(parent)
+     , m_request {request}
+     , m_filePath {filePath}
++    , m_file {std::move(file)}
+     , m_headers {headers}
+     , m_socket {socket}
+ {
+@@ -308,7 +317,7 @@
+         return;
+ 
+     m_dataPipe = std::make_shared<DataPipe>();
+-    m_worker = new Worker(m_filePath, m_request, m_headers, m_dataPipe);
++    m_worker = new Worker(m_filePath, m_request, m_headers, m_dataPipe, std::move(m_file));
+     connect(m_worker, &QThread::finished, m_worker, &QObject::deleteLater);
+     // `Worker` (aka `QThread`) instance lives in the main thread that instantiated it,
+     // not in the new thread that calls `run()`. So there is no problem having `std::shared_ptr<DataPipe>`
+@@ -329,6 +338,13 @@
+     if (m_state != State::Running)
+         return;
+ 
++    if (m_inputFinished)
++    {
++        if (m_socket->bytesToWrite() == 0)
++            finish();
++        return;
++    }
++
+     const qint64 bufferedDataSize = m_socket->bytesToWrite();
+     const qint64 allowedDataSizeToWrite = adjustDataSize(MAX_BUFFER_SIZE - bufferedDataSize);
+     if (allowedDataSizeToWrite <= 0)
+@@ -340,7 +356,8 @@
+         const qint64 bytesWritten = m_socket->write(dataToWrite);
+         if (bytesWritten < 0)
+         {
+-            m_worker->requestInterruption();
++            if (m_worker)
++                m_worker->requestInterruption();
+             // Need to release the data pipe in case the working thread is waiting for write.
+             m_dataPipe->read(MAX_BUFFER_SIZE);
+             fail();
+@@ -348,12 +365,18 @@
+         }
+ 
+         const qint64 bytesToWrite = m_socket->bytesToWrite();
+-        if (bytesToWrite >= MAX_BUFFER_SIZE)
++        if (!atEnd && (bytesToWrite >= MAX_BUFFER_SIZE))
+             m_socket->flush();
+     }
+ 
+     if (atEnd)
+-        finish();
++    {
++        m_inputFinished = true;
++        if (m_socket->bytesToWrite() == 0)
++            finish();
++        else
++            m_socket->flush();
++    }
+ }
+ 
+ void Http::AsyncFileSender::fail()
+--- a/src/base/http/asyncfilesender.h
++++ b/src/base/http/asyncfilesender.h
+@@ -38,6 +38,7 @@
+ #include "request.h"
+ 
+ class QAbstractSocket;
++class QFile;
+ class QThread;
+ 
+ namespace Http
+@@ -56,7 +57,8 @@
+             Failed
+         };
+ 
+-        AsyncFileSender(const Request &request, const Path &filePath, const HeaderMap &headers, QAbstractSocket *socket, QObject *parent = nullptr);
++        AsyncFileSender(const Request &request, const Path &filePath, const HeaderMap &headers, QAbstractSocket *socket,
++            std::shared_ptr<QFile> file = {}, QObject *parent = nullptr);
+         ~AsyncFileSender() override;
+ 
+         State state() const;
+@@ -73,9 +75,11 @@
+         void finish();
+ 
+         State m_state = State::Ready;
++        bool m_inputFinished = false;
+ 
+         Request m_request;
+         Path m_filePath;
++        std::shared_ptr<QFile> m_file;
+         HeaderMap m_headers;
+         QAbstractSocket *m_socket = nullptr;
+ 
+--- a/src/base/http/requestparser.cpp
++++ b/src/base/http/requestparser.cpp
+@@ -243,8 +243,8 @@
+             const QByteArrayView nameComponent = param.first(eqCharPos);
+             const QByteArrayView valueComponent = param.sliced(eqCharPos + 1);
+             const QString paramName = QString::fromUtf8(
+-                QByteArray::fromPercentEncoding(asQByteArray(nameComponent)).replace('+', ' '));
+-            const QByteArray paramValue = QByteArray::fromPercentEncoding(asQByteArray(valueComponent)).replace('+', ' ');
++                QByteArray::fromPercentEncoding(asQByteArray(nameComponent).replace('+', ' ')));
++            const QByteArray paramValue = QByteArray::fromPercentEncoding(asQByteArray(valueComponent).replace('+', ' '));
+ 
+             m_request.query[paramName] = paramValue;
+         }
+--- a/src/base/http/responsewriter.h
++++ b/src/base/http/responsewriter.h
+@@ -28,7 +28,11 @@
+ 
+ #pragma once
+ 
++#include <memory>
++
+ #include <QObject>
++
++class QFile;
+ 
+ #include "base/pathfwd.h"
+ #include "headermap.h"
+@@ -50,7 +54,7 @@
+ 
+         // Allow to stream file using separate IO thread for reading.
+         // Support Range requests.
+-        virtual void streamFile(const Path &filePath, const HeaderMap &headers) = 0;
++        virtual void streamFile(const Path &filePath, const HeaderMap &headers, std::shared_ptr<QFile> file = {}) = 0;
+ 
+         virtual bool isFinished() const = 0;
+ 
+--- a/src/base/http/responsewriterimpl.cpp
++++ b/src/base/http/responsewriterimpl.cpp
+@@ -73,13 +73,13 @@
+     finish();
+ }
+ 
+-void Http::ResponseWriterImpl::streamFile(const Path &filePath, const HeaderMap &headers)
++void Http::ResponseWriterImpl::streamFile(const Path &filePath, const HeaderMap &headers, std::shared_ptr<QFile> file)
+ {
+     Q_ASSERT(m_state == State::Ready);
+     if (m_state != State::Ready) [[unlikely]]
+         return;
+ 
+-    m_asyncFileSender = new AsyncFileSender(m_request, filePath, headers, m_socket);
++    m_asyncFileSender = new AsyncFileSender(m_request, filePath, headers, m_socket, std::move(file));
+ 
+     connect(m_asyncFileSender, &AsyncFileSender::failed, this, [this]
+     {
+--- a/src/base/http/responsewriterimpl.h
++++ b/src/base/http/responsewriterimpl.h
+@@ -67,7 +67,7 @@
+ 
+         // Allow to stream file using separate IO thread for reading.
+         // Support Range requests.
+-        void streamFile(const Path &filePath, const HeaderMap &headers) override;
++        void streamFile(const Path &filePath, const HeaderMap &headers, std::shared_ptr<QFile> file = {}) override;
+ 
+         bool isFinished() const override;
+         State state() const;
+--- a/src/webui/CMakeLists.txt
++++ b/src/webui/CMakeLists.txt
+@@ -16,6 +16,7 @@
+     api/transfercontroller.h
+     api/serialize/serialize_torrent.h
+     clientdatastorage.h
++    externaldownloads.h
+     searchjobmanager.h
+     webapplication.h
+     websession.h
+@@ -36,6 +37,7 @@
+     api/transfercontroller.cpp
+     api/serialize/serialize_torrent.cpp
+     clientdatastorage.cpp
++    externaldownloads.cpp
+     searchjobmanager.cpp
+     webapplication.cpp
+     websession.cpp
+--- /dev/null
++++ b/src/webui/externaldownloads.cpp
+@@ -0,0 +1,283 @@
++#include "externaldownloads.h"
++
++#include <dirent.h>
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <sys/sysmacros.h>
++#include <unistd.h>
++
++#include <memory>
++#include <utility>
++
++#include <QFile>
++#include <QFileInfo>
++#include <QJsonArray>
++#include <QJsonDocument>
++#include <QJsonObject>
++#include <QRegularExpression>
++#include <QSet>
++#include <QUrl>
++
++#include "base/http/constants.h"
++#include "base/http/httperror.h"
++#include "base/http/request.h"
++#include "base/http/responsewriter.h"
++#include "base/path.h"
++
++using namespace Qt::StringLiterals;
++
++namespace
++{
++    constexpr int DIR_FLAGS = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
++    constexpr int FILE_FLAGS = O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC;
++    constexpr int PAGE_SIZE = 256;
++
++    class Descriptor
++    {
++    public:
++        explicit Descriptor(const int fd = -1) : m_fd(fd) {}
++        ~Descriptor() { reset(); }
++        Descriptor(Descriptor &&other) noexcept : m_fd(other.release()) {}
++        Descriptor(const Descriptor &) = delete;
++        Descriptor &operator=(const Descriptor &) = delete;
++        int get() const { return m_fd; }
++        int release() { return std::exchange(m_fd, -1); }
++        void reset(const int fd = -1)
++        {
++            if (m_fd >= 0)
++                ::close(m_fd);
++            m_fd = fd;
++        }
++
++    private:
++        int m_fd;
++    };
++
++    struct Volume
++    {
++        QString path;
++        QByteArray device;
++    };
++
++    QByteArray mountPath(QByteArray field)
++    {
++        return field.replace("\\040", " ").replace("\\011", "\t")
++            .replace("\\012", "\n").replace("\\134", "\\");
++    }
++
++    QString diskPath(const QByteArray &device)
++    {
++        const QString path = QFileInfo(u"/sys/dev/block/"_s + QString::fromLatin1(device)).canonicalFilePath();
++        if (!path.isEmpty() && QFileInfo::exists(path + u"/partition"))
++            return QFileInfo(path).path();
++        return path;
++    }
++
++    QList<Volume> mountedVolumes()
++    {
++        QFile mounts(u"/proc/self/mountinfo"_s);
++        QList<Volume> candidates;
++        QSet<QString> systemDisks;
++        if (!mounts.open(QIODevice::ReadOnly))
++            return candidates;
++
++        for (QByteArray line = mounts.readLine(); !line.isEmpty(); line = mounts.readLine())
++        {
++            const auto fields = line.split(' ');
++            if (fields.size() < 7)
++                continue;
++            const QByteArray path = mountPath(fields[4]);
++            if ((path == "/") || (path == "/rom") || (path == "/overlay") || (path == "/boot"))
++                systemDisks.insert(diskPath(fields[2]));
++            if ((fields[3] == "/") && ((path == "/mnt") || path.startsWith("/mnt/")))
++            {
++                const QString decoded = QFile::decodeName(path);
++                if (QFile::encodeName(decoded) == path)
++                    candidates.append({decoded, fields[2]});
++            }
++        }
++
++        static const QRegularExpression usbPath(u"/usb[0-9]+/.+/block/"_s);
++        QList<Volume> volumes;
++        for (const auto &volume : candidates)
++        {
++            const QString disk = diskPath(volume.device);
++            if (usbPath.match(disk).hasMatch() && !disk.contains(u"/16f0000000000.ehci/")
++                && !systemDisks.contains(disk))
++            {
++                volumes.append(volume);
++            }
++        }
++        return volumes;
++    }
++
++    QByteArray deviceNumber(const dev_t device)
++    {
++        return QByteArray::number(major(device)) + ':' + QByteArray::number(minor(device));
++    }
++
++    Descriptor openPath(Descriptor directory, const QString &path, const int lastFlags,
++        const QByteArray &requiredDevice = {})
++    {
++        if (directory.get() < 0)
++            throw NotFoundHTTPError();
++        if (path.isEmpty())
++            return directory;
++
++        const auto parts = path.split(u'/');
++        for (qsizetype index = 0; index < parts.size(); ++index)
++        {
++            const QString &part = parts[index];
++            if (part.isEmpty() || (part == u".") || (part == u"..") || part.contains(QChar::Null))
++                throw BadRequestHTTPError();
++
++            const QByteArray name = QFile::encodeName(part);
++            const int flags = (index == (parts.size() - 1)) ? lastFlags : DIR_FLAGS;
++            directory.reset(::openat(directory.get(), name.constData(), flags));
++            struct stat info {};
++            if ((directory.get() < 0) || (::fstat(directory.get(), &info) < 0)
++                || (!requiredDevice.isEmpty() && (deviceNumber(info.st_dev) != requiredDevice)))
++            {
++                throw NotFoundHTTPError();
++            }
++        }
++        return directory;
++    }
++
++    Descriptor openVolume(const Volume &volume)
++    {
++        const QString relative = (volume.path == u"/mnt") ? QString{} : volume.path.sliced(5);
++        auto directory = openPath(Descriptor(::open("/mnt", DIR_FLAGS)), relative, DIR_FLAGS);
++        struct stat info {};
++        if ((::fstat(directory.get(), &info) < 0) || (deviceNumber(info.st_dev) != volume.device))
++            throw NotFoundHTTPError();
++        return directory;
++    }
++
++    QJsonObject listDirectory(const Volume &volume, const QString &path, const int offset)
++    {
++        auto fd = openPath(openVolume(volume), path, DIR_FLAGS, volume.device);
++        std::unique_ptr<DIR, decltype(&::closedir)> dir(::fdopendir(fd.get()), &::closedir);
++        if (!dir)
++            throw NotFoundHTTPError();
++        fd.release();
++
++        QJsonArray files;
++        bool more = false;
++        int remaining = offset;
++        while (const auto *entry = ::readdir(dir.get()))
++        {
++            const QByteArray name(entry->d_name);
++            if ((name == ".") || (name == ".."))
++                continue;
++            const QString decoded = QFile::decodeName(name);
++            if (QFile::encodeName(decoded) != name)
++                continue;
++            struct stat info {};
++            const int dirFd = ::dirfd(dir.get());
++            if ((::fstatat(dirFd, name.constData(), &info, AT_SYMLINK_NOFOLLOW) < 0)
++                || (deviceNumber(info.st_dev) != volume.device)
++                || (!S_ISDIR(info.st_mode) && !S_ISREG(info.st_mode))
++                || (::faccessat(dirFd, name.constData(), S_ISDIR(info.st_mode) ? (R_OK | X_OK) : R_OK, 0) < 0))
++            {
++                continue;
++            }
++            if (remaining > 0)
++            {
++                --remaining;
++                continue;
++            }
++            if (files.size() == PAGE_SIZE)
++            {
++                more = true;
++                break;
++            }
++            files.append(QJsonObject {{u"name"_s, decoded}, {u"directory"_s, S_ISDIR(info.st_mode) != 0},
++                {u"size"_s, static_cast<qint64>(info.st_size)}});
++        }
++        return {{u"files"_s, files}, {u"nextOffset"_s, more ? (offset + PAGE_SIZE) : -1}};
++    }
++
++    void download(const Volume &volume, const QString &path,
++        Http::HeaderMap headers, Http::ResponseWriter &writer)
++    {
++        if (path.isEmpty())
++            throw BadRequestHTTPError();
++
++        auto fd = openPath(openVolume(volume), path, FILE_FLAGS, volume.device);
++        struct stat info {};
++        if ((::fstat(fd.get(), &info) < 0) || !S_ISREG(info.st_mode))
++            throw NotFoundHTTPError();
++
++        ::posix_fadvise(fd.get(), 0, 0, POSIX_FADV_SEQUENTIAL);
++        auto file = std::make_shared<QFile>();
++        if (!file->open(fd.get(), QIODevice::ReadOnly | QIODevice::Unbuffered, QFileDevice::AutoCloseHandle))
++            throw NotFoundHTTPError();
++        fd.release();
++
++        const QString name = path.sliced(path.lastIndexOf(u'/') + 1);
++        headers.insert(Http::HEADER_CONTENT_TYPE, u"application/octet-stream"_s);
++        headers.insert(Http::HEADER_CONTENT_DISPOSITION, u"attachment; filename=\"download\"; filename*=UTF-8''"_s
++            + QString::fromLatin1(QUrl::toPercentEncoding(name)));
++        headers.insert(Http::HEADER_CACHE_CONTROL, u"private, no-store"_s);
++        writer.streamFile(Path(name), headers, std::move(file));
++    }
++}
++
++void ExternalDownloads::process(const QString &action, const Http::Request &request,
++    const Http::HeaderMap &commonHeaders, Http::ResponseWriter &writer)
++{
++    if ((request.method != Http::HEADER_REQUEST_METHOD_GET) && (request.method != Http::HEADER_REQUEST_METHOD_HEAD))
++        throw MethodNotAllowedHTTPError();
++
++    const QString volumePath = QString::fromUtf8(request.query.value(u"volume"_s));
++    const QString path = QString::fromUtf8(request.query.value(u"path"_s));
++    const auto volumes = mountedVolumes();
++    if (action == u"volumes")
++    {
++        QJsonArray result;
++        for (const auto &volume : volumes)
++        {
++            try
++            {
++                openVolume(volume);
++                result.append(volume.path);
++            }
++            catch (const NotFoundHTTPError &)
++            {
++            }
++        }
++        Http::Response response {.status = {.code = 200}, .headers = commonHeaders,
++            .content = QJsonDocument(result).toJson(QJsonDocument::Compact)};
++        response.headers.insert(Http::HEADER_CONTENT_TYPE, u"application/json"_s);
++        response.headers.insert(Http::HEADER_CACHE_CONTROL, u"private, no-store"_s);
++        writer.setResponse(response);
++        return;
++    }
++
++    for (const auto &volume : volumes)
++    {
++        if (volume.path != volumePath)
++            continue;
++        if (action == u"download")
++        {
++            download(volume, path, commonHeaders, writer);
++            return;
++        }
++        if (action == u"list")
++        {
++            bool validOffset = false;
++            const int offset = request.query.value(u"offset"_s, "0").toInt(&validOffset);
++            if (!validOffset || (offset < 0) || (offset > 1000000))
++                throw BadRequestHTTPError();
++            const auto result = listDirectory(volume, path, offset);
++            Http::Response response {.status = {.code = 200}, .headers = commonHeaders,
++                .content = QJsonDocument(result).toJson(QJsonDocument::Compact)};
++            response.headers.insert(Http::HEADER_CONTENT_TYPE, u"application/json"_s);
++            response.headers.insert(Http::HEADER_CACHE_CONTROL, u"private, no-store"_s);
++            writer.setResponse(response);
++            return;
++        }
++    }
++    throw NotFoundHTTPError();
++}
+--- /dev/null
++++ b/src/webui/externaldownloads.h
+@@ -0,0 +1,17 @@
++#pragma once
++
++#include <QString>
++
++#include "base/http/headermap.h"
++
++namespace Http
++{
++    struct Request;
++    class ResponseWriter;
++}
++
++namespace ExternalDownloads
++{
++    void process(const QString &action, const Http::Request &request,
++        const Http::HeaderMap &commonHeaders, Http::ResponseWriter &writer);
++}
+--- a/src/webui/webapplication.cpp
++++ b/src/webui/webapplication.cpp
+@@ -71,6 +71,7 @@
+ #include "api/transfercontroller.h"
+ #include "clientdatastorage.h"
+ #include "searchjobmanager.h"
++#include "externaldownloads.h"
+ #include "websession.h"
+ 
+ const int MAX_ALLOWED_FILESIZE = 10 * 1024 * 1024;
+@@ -327,6 +328,12 @@
+     // Check public/private scope
+     if (!session() && !isPublicAPI(scope, action))
+         throw ForbiddenHTTPError();
++
++    if (scope == u"externalDownloads")
++    {
++        ExternalDownloads::process(action, m_request, commonHeaders, responseWriter);
++        return;
++    }
+ 
+     // Find matching API
+     APIController *controller = nullptr;
+--- /dev/null
++++ b/src/webui/www/private/css/external-downloads.css
+@@ -0,0 +1,44 @@
++:root {
++    color-scheme: light dark;
++    font: 16px/1.5 system-ui, sans-serif;
++}
++
++main {
++    max-width: 68rem;
++    margin: 2rem auto;
++    padding: 0 1rem;
++}
++
++.toolbar {
++    display: flex;
++    flex-wrap: wrap;
++    align-items: center;
++    gap: .7rem;
++    margin: .8rem 0;
++}
++
++[hidden] { display: none; }
++
++select, button {
++    max-width: 100%;
++    padding: .3em .55em;
++    font: inherit;
++}
++
++button:not(:disabled) { cursor: pointer; }
++
++#path { overflow-wrap: anywhere; }
++
++table {
++    width: 100%;
++    border-collapse: collapse;
++}
++
++th, td {
++    padding: .55em .6em;
++    text-align: left;
++    border-bottom: 1px solid GrayText;
++}
++
++td:first-child { overflow-wrap: anywhere; }
++td:nth-child(2), td:nth-child(3) { white-space: nowrap; }
+--- /dev/null
++++ b/src/webui/www/private/external-downloads.html
+@@ -0,0 +1,36 @@
++<!doctype html>
++<html lang="zh-CN">
++<head>
++    <meta charset="utf-8">
++    <meta name="viewport" content="width=device-width, initial-scale=1">
++    <title>HTTP 下载 | qBittorrent</title>
++    <link rel="stylesheet" href="css/external-downloads.css">
++    <script defer src="scripts/external-downloads.js?v=${CACHEID}"></script>
++</head>
++<body>
++    <main>
++        <header>
++            <a href="./">← qBittorrent</a>
++            <h1>HTTP 下载</h1>
++        </header>
++        <div class="toolbar">
++            <label for="volume">外置盘</label>
++            <select id="volume"></select>
++            <button id="refresh" type="button">刷新</button>
++        </div>
++        <div class="toolbar">
++            <button id="parent" type="button" disabled>上一级</button>
++            <span id="path">/</span>
++        </div>
++        <p id="status" role="status">正在查找外置盘…</p>
++        <table id="files" hidden>
++            <thead><tr><th scope="col">名称</th><th scope="col">大小</th><th scope="col">操作</th></tr></thead>
++            <tbody id="entries"></tbody>
++        </table>
++        <nav class="toolbar" id="pages" aria-label="分页" hidden>
++            <button id="previous" type="button" disabled>上一页</button>
++            <button id="next" type="button" disabled>下一页</button>
++        </nav>
++    </main>
++</body>
++</html>
+--- a/src/webui/www/private/index.html
++++ b/src/webui/www/private/index.html
+@@ -68,6 +68,7 @@
+                                 </div>
+                             </li>
+                             <li><a id="downloadLink"><img class="MyMenuIcon" alt="QBT_TR(Add Torrent Link...)QBT_TR[CONTEXT=MainWindow]" src="images/insert-link.svg" width="16" height="16">QBT_TR(Add Torrent Link...)QBT_TR[CONTEXT=MainWindow]</a></li>
++                            <li><a href="external-downloads.html"><img class="MyMenuIcon" src="images/download.svg" alt="" width="16" height="16">HTTP 下载</a></li>
+                             <li class="divider"><a id="logoutLink"><img class="MyMenuIcon" alt="QBT_TR(Logout)QBT_TR[CONTEXT=HttpServer]" src="images/system-log-out.svg" width="16" height="16">QBT_TR(Logout)QBT_TR[CONTEXT=HttpServer]</a></li>
+                             <li><a id="shutdownLink"><img class="MyMenuIcon" alt="QBT_TR(Exit qBittorrent)QBT_TR[CONTEXT=HttpServer]" src="images/application-exit.svg" width="16" height="16">QBT_TR(Exit qBittorrent)QBT_TR[CONTEXT=HttpServer]</a></li>
+                         </ul>
+--- /dev/null
++++ b/src/webui/www/private/scripts/external-downloads.js
+@@ -0,0 +1,132 @@
++"use strict";
++
++const byId = (id) => document.getElementById(id);
++const volume = byId("volume");
++const status = byId("status");
++const table = byId("files");
++const entries = byId("entries");
++const pages = byId("pages");
++const parent = byId("parent");
++const previous = byId("previous");
++const next = byId("next");
++let path = [];
++let pageOffsets = [0];
++let nextOffset = -1;
++let generation = 0;
++
++function endpoint(action, parameters = {}) {
++    return "api/v2/externalDownloads/" + action + "?" + new URLSearchParams(parameters);
++}
++
++async function get(action, parameters) {
++    const response = await fetch(endpoint(action, parameters), { cache: "no-store" });
++    if (response.status === 403)
++        throw new Error("登录已失效，请返回 qBittorrent 登录。");
++    if (!response.ok)
++        throw new Error("无法读取目录。请确认外置盘仍然挂载并且文件可读。");
++    return response.json();
++}
++
++function sizeText(size) {
++    if (size < 1024)
++        return size + " B";
++    const units = ["KiB", "MiB", "GiB", "TiB"];
++    let power = 0;
++    while ((size >= (1024 * 1024)) && (power < (units.length - 1))) {
++        size /= 1024;
++        ++power;
++    }
++    return (size / 1024).toFixed(1) + " " + units[power];
++}
++
++function row(file) {
++    const item = document.createElement("tr");
++    const name = item.insertCell();
++    const size = item.insertCell();
++    const action = item.insertCell();
++    if (file.directory) {
++        const button = document.createElement("button");
++        button.type = "button";
++        button.textContent = file.name + "/";
++        button.addEventListener("click", () => navigate([...path, file.name]));
++        name.append(button);
++    }
++    else {
++        name.textContent = file.name;
++        size.textContent = sizeText(file.size);
++        const link = document.createElement("a");
++        link.textContent = "下载";
++        link.href = endpoint("download", { volume: volume.value, path: [...path, file.name].join("/") });
++        action.append(link);
++    }
++    return item;
++}
++
++async function load() {
++    const request = ++generation;
++    parent.disabled = path.length === 0;
++    byId("path").textContent = "/" + path.join("/");
++    table.hidden = true;
++    pages.hidden = true;
++    if (!volume.value) {
++        status.textContent = "未找到可读的外置盘。";
++        return;
++    }
++    status.textContent = "正在读取目录…";
++    try {
++        const data = await get("list", { volume: volume.value, path: path.join("/"), offset: pageOffsets.at(-1) });
++        if (request !== generation)
++            return;
++        entries.replaceChildren(...data.files.map(row));
++        table.hidden = data.files.length === 0;
++        status.textContent = data.files.length ? "" : "此目录没有可读文件。";
++        nextOffset = data.nextOffset;
++        previous.disabled = pageOffsets.length === 1;
++        next.disabled = nextOffset < 0;
++        pages.hidden = previous.disabled && next.disabled;
++    }
++    catch (error) {
++        if (request === generation)
++            status.textContent = error.message;
++    }
++}
++
++function navigate(parts) {
++    path = parts;
++    pageOffsets = [0];
++    load();
++}
++
++async function refresh() {
++    const request = ++generation;
++    const selected = volume.value;
++    table.hidden = true;
++    pages.hidden = true;
++    status.textContent = "正在查找外置盘…";
++    try {
++        const volumes = await get("volumes");
++        if (request !== generation)
++            return;
++        volume.replaceChildren(...volumes.map((mount) => new Option(mount, mount)));
++        if (volumes.includes(selected))
++            volume.value = selected;
++        navigate(volumes.includes(selected) ? path : []);
++    }
++    catch (error) {
++        if (request === generation)
++            status.textContent = error.message;
++    }
++}
++
++byId("refresh").addEventListener("click", refresh);
++volume.addEventListener("change", () => navigate([]));
++parent.addEventListener("click", () => navigate(path.slice(0, -1)));
++previous.addEventListener("click", () => {
++    pageOffsets.pop();
++    load();
++});
++next.addEventListener("click", () => {
++    pageOffsets.push(nextOffset);
++    load();
++});
++refresh();
+--- a/src/webui/www/webui.qrc
++++ b/src/webui/www/webui.qrc
+@@ -18,6 +18,9 @@
+         <file>private/css/vanillaSelectBox.css</file>
+         <file>private/css/Window.css</file>
+         <file>private/download.html</file>
++        <file>private/external-downloads.html</file>
++        <file>private/css/external-downloads.css</file>
++        <file>private/scripts/external-downloads.js</file>
+         <file>private/editfeedurl.html</file>
+         <file>private/edittracker.html</file>
+         <file>private/editwebseed.html</file>

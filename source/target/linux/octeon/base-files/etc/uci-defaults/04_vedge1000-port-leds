@@ -4,8 +4,6 @@
 
 [ "$(board_name)" = "cisco,vedge1000" ] || exit 0
 
-# Older images used invalid UCI section names for the SFP LEDs.
-# Add settings for LEDs that do not already have a user configuration.
 configured_leds=
 remember_led() {
 	local sysfs
@@ -13,35 +11,46 @@ remember_led() {
 	configured_leds="$configured_leds $sysfs "
 }
 
+add_led() {
+	local sysfs="$1" name="$2" trigger="$3" section port mode
+	shift 3
+
+	case "$configured_leds" in
+		*" $sysfs "*) return 0 ;;
+	esac
+	section=$(uci add system led) || return 1
+	{
+		printf "set system.%s.sysfs='%s'\n" "$section" "$sysfs"
+		printf "set system.%s.name='%s'\n" "$section" "$name"
+		printf "set system.%s.trigger='%s'\n" "$section" "$trigger"
+		case "$trigger" in
+			netdev)
+				port="$1"
+				shift
+				printf "set system.%s.dev='%s'\n" "$section" "$port"
+				if [ "$sysfs" = "$port:green:activity" ]; then
+					printf "set system.%s.interval='100'\n" "$section"
+				fi
+				for mode in "$@"; do
+					printf "add_list system.%s.mode='%s'\n" "$section" "$mode"
+				done
+				;;
+			heartbeat)
+				printf "set system.%s.inverted='1'\n" "$section"
+				;;
+		esac
+	} | uci batch
+}
+
 config_load system
 config_foreach remember_led led
 
-for port in lan0 lan1 lan2 lan3 lan4 lan5 lan6 lan7; do
-	case "$configured_leds" in
-		*" $port:green:status "*) ;;
-		*)
-			section=$(uci add system led) || exit 1
-			uci batch <<-EOF || exit 1
-				set system.$section.name='$port link/activity'
-				set system.$section.trigger='netdev'
-				set system.$section.dev='$port'
-				set system.$section.mode='link tx rx'
-				set system.$section.sysfs='$port:green:status'
-			EOF
-			;;
-	esac
-	case "$configured_leds" in
-		*" $port:green:activity "*) ;;
-		*)
-			section=$(uci add system led) || exit 1
-			uci batch <<-EOF || exit 1
-				set system.$section.name='$port auxiliary'
-				set system.$section.trigger='none'
-				set system.$section.default='0'
-				set system.$section.sysfs='$port:green:activity'
-			EOF
-			;;
-	esac
+for port in lan1 lan2 lan3 lan4 lan5 lan6 lan7 lan0; do
+	number=${port#lan}
+	add_led "$port:green:status" "LAN$number LINK" netdev "$port" link_1000 full_duplex || exit 1
+	add_led "$port:green:activity" "LAN$number ACT" netdev "$port" link tx rx || exit 1
 done
+add_led green:status "SYS LOAD" heartbeat || exit 1
+add_led green:activity "SYS REDY" default-on || exit 1
 
 uci commit system

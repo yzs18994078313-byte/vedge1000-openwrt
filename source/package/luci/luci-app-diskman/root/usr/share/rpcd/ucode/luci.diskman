@@ -1,0 +1,564 @@
+#!/usr/bin/env ucode
+
+'use strict';
+
+let fs = require("fs");
+
+function read_file(path) {
+	let f = fs.open(path, "r");
+	if (!f) return "";
+
+	let res = f.read("all");
+	f.close();
+
+	if (res == null) return "";
+	return trim(res);
+}
+
+function file_exists(path) {
+	let f = fs.open(path, "r");
+	if (f) {
+		f.close();
+		return true;
+	}
+	return false;
+}
+
+function exec_cmd_status(cmd) {
+	let f = fs.popen(cmd, "r");
+	if (!f) return { out: "", code: -1 };
+
+	let res = f.read("all");
+	let code = f.close();
+
+	if (res == null) res = "";
+	return { out: trim(res), code: code };
+}
+
+function exec_cmd(cmd) {
+	return exec_cmd_status(cmd).out;
+}
+
+function fix_gpt_if_needed(dev) {
+	let check = exec_cmd("parted -s " + dev + " print 2>&1");
+	if (match(check, /Not all of the space available/)) {
+		exec_cmd("printf 'Fix\\nFix\\n' | parted ---pretend-input-tty " + dev + " print 2>/dev/null");
+	}
+}
+
+function parse_smart(dev) {
+	let out = exec_cmd("smartctl -a " + dev);
+	let res = { model: "-", serial: "-", temp: "-", sata_ver: "-", rpm: "-", health: "-" };
+	
+	if (!out || match(out, /Unable to detect device type/)) return res;
+
+	let lines = split(out, "\n");
+	for (let i = 0; i < length(lines); i++) {
+		let line = lines[i];
+		let m;
+
+		if ((m = match(line, /^(Model Number|Device Model|Vendor):\s+(.+)$/))) {
+			res.model = trim(m[2]);
+		} else if ((m = match(line, /^Serial Number:\s+(.+)$/))) {
+			res.serial = trim(m[1]);
+		} else if ((m = match(line, /^Temperature:\s+(.+)$/))) {
+			res.temp = trim(m[1]);
+		} else if ((m = match(line, /^Current Drive Temperature:\s+(.+)$/))) {
+			res.temp = trim(m[1]);
+		} else if ((m = match(line, /^194 Temperature_Celsius[^-]*-\s+(\d+)/))) {
+			if (res.temp == "-") res.temp = trim(m[1]);
+		} else if ((m = match(line, /^(SATA Version is|NVMe Version):\s+(.+)$/))) {
+			res.sata_ver = trim(m[2]);
+		} else if ((m = match(line, /^Rotation Rate:\s+(.+)$/))) {
+			res.rpm = trim(m[1]);
+		} else if ((m = match(line, /^(SMART overall-health self-assessment test result|SMART Health Status):\s+(.+)$/))) {
+			res.health = trim(m[2]);
+		}
+	}
+
+	if (res.temp != "-") {
+		let tm = match(res.temp, /^(\d+)/);
+		if (tm) {
+			res.temp = tm[1] + "℃";
+		}
+	}
+
+	return res;
+}
+
+
+// The N821 upgrade script uses the storage behind this controller as its boot disk.
+function disk_name(device) {
+	if (!device || !match(device, /^\/dev\/[a-zA-Z0-9_-]+$/)) return "";
+	let entry = "/sys/class/block/" + substr(device, 5);
+	let link = fs.readlink(entry);
+	if (!link || index(link, "/virtual/block/") >= 0) return "";
+	let names = split(link, "/");
+	return names[length(names) - (file_exists(entry + "/partition") ? 2 : 1)];
+}
+
+function external_device(device) {
+	let disk = disk_name(device);
+	if (!disk) return false;
+	let link = fs.readlink("/sys/class/block/" + disk);
+	if (!link || index(link, "/16f0000000000.ehci/") >= 0) return false;
+	let mounts = split(read_file("/proc/self/mountinfo"), "\n");
+	for (let i = 0; i < length(mounts); i++) {
+		let fields = split(mounts[i], " ");
+		if (index(["/", "/rom", "/overlay", "/boot"], fields[4]) < 0) continue;
+		let mounted = fs.readlink("/sys/dev/block/" + fields[2]);
+		if (!mounted) continue;
+		let names = split(mounted, "/");
+		if (disk_name("/dev/" + names[length(names) - 1]) == disk) return false;
+	}
+	return true;
+}
+
+function in_use(device, whole_disk) {
+	let disk = disk_name(device);
+	let paths = ["/proc/mounts", "/proc/swaps"];
+	for (let i = 0; i < length(paths); i++) {
+		let lines = split(read_file(paths[i]), "\n");
+		for (let j = 0; j < length(lines); j++) {
+			let mounted = split(lines[j], " ")[0];
+			if (mounted == device || (whole_disk && disk_name(mounted) == disk)) return true;
+		}
+	}
+	return false;
+}
+
+const methods = {
+	get_disk_info: {
+		call: function() {
+			let disks = [];
+			let supported_fs_map = {};
+			let search_dirs = ["/sbin", "/usr/sbin", "/bin", "/usr/bin"];
+
+			for (let d = 0; d < length(search_dirs); d++) {
+				let bins = fs.glob(search_dirs[d] + "/mkfs.*");
+				if (type(bins) == "array") {
+					for (let i = 0; i < length(bins); i++) {
+						let m = match(bins[i], /mkfs\.([^/]+)$/);
+						if (m) {
+							if (m[1] == "fat" || m[1] == "vfat" || m[1] == "msdos") {
+								supported_fs_map["fat16"] = true;
+								supported_fs_map["fat32"] = true;
+							} else if (match(m[1], /^(ext[234]|exfat)$/)) {
+								supported_fs_map[m[1]] = true;
+							}
+						}
+					}
+				}
+			}
+			
+
+			let supported_fs = [];
+			for (let k in supported_fs_map) {
+				push(supported_fs, k);
+			}
+
+			let blocks = fs.glob("/sys/block/*");
+			if (type(blocks) != "array") {
+				return { disks: disks, supported_fs: supported_fs };
+			}
+
+			let fs_info = {};
+			let block_info_out = exec_cmd("block info");
+			if (block_info_out != "") {
+				let lines = split(block_info_out, "\n");
+				for (let i = 0; i < length(lines); i++) {
+					let line = lines[i];
+					let dev_match = match(line, /^(\/dev\/[a-zA-Z0-9_.-]+):/);
+					let type_match = match(line, /TYPE="([^"]+)"/);
+					let mount_match = match(line, /MOUNT="([^"]+)"/);
+					
+					if (dev_match) {
+						fs_info[dev_match[1]] = {
+							type: type_match ? type_match[1] : "unknown",
+							mount: mount_match ? mount_match[1] : ""
+						};
+					}
+				}
+			}
+
+			let df_info = {};
+			let df_out = exec_cmd("df -k");
+			if (df_out != "") {
+				let lines = split(df_out, "\n");
+				for (let i = 0; i < length(lines); i++) {
+					let line = lines[i];
+					let m = match(line, /^(\/dev\/[a-zA-Z0-9_.-]+)\s+(\d+)\s+(\d+)\s+(\d+)\s+([0-9]+%)\s+(.+)$/);
+					
+					if (m) {
+						df_info[m[1]] = {
+							used: int(m[3]) * 1024,
+							free: int(m[4]) * 1024,
+							usage: m[5]
+						};
+					}
+				}
+			}
+
+			for (let i = 0; i < length(blocks); i++) {
+				let block_path = blocks[i];
+				let parts_arr = split(block_path, "/");
+				let dev_name = parts_arr[length(parts_arr) - 1];
+
+				if (match(dev_name, /^(loop|ram|mtdblock|zram|sr)/) || match(dev_name, /boot[0-9]+$/)) {
+					continue;
+				}
+
+				let size_str = read_file(block_path + "/size");
+				let disk_size = (int(size_str) || 0) * 512;
+				let full_dev_path = "/dev/" + dev_name;
+				if (!external_device(full_dev_path)) continue;
+
+				let log_sec = read_file(block_path + "/queue/logical_block_size");
+				let phy_sec = read_file(block_path + "/queue/physical_block_size");
+				let sector_size_str = (log_sec || "512") + "/" + (phy_sec || "512");
+
+				let ptable_out = exec_cmd("parted -s " + full_dev_path + " print 2>/dev/null | grep 'Partition Table'");
+				let ptable_m = match(ptable_out, /Partition Table:\s+(.+)/);
+				let ptable_val = "-";
+				
+				if (ptable_m) {
+					let p_type = trim(ptable_m[1]);
+					if (p_type == "msdos") ptable_val = "MBR";
+					else if (p_type == "gpt") ptable_val = "GPT";
+					else if (p_type == "loop") ptable_val = "LOOP";
+					else ptable_val = p_type;
+				}
+
+				let smart = parse_smart(full_dev_path);
+				let sys_model = "";
+				let sys_serial = read_file(block_path + "/device/serial");
+
+				if (match(dev_name, /^mmcblk/)) {
+					sys_model = read_file(block_path + "/device/name");
+				} else {
+					sys_model = read_file(block_path + "/device/model");
+				}
+
+				let final_model = (smart.model != "-" && smart.model != "") ? smart.model : (sys_model || "-");
+				let final_serial = (smart.serial != "-" && smart.serial != "") ? smart.serial : (sys_serial || "-");
+
+				let disk_obj = {
+					path: full_dev_path,
+					name: dev_name,
+					model: final_model,
+					serial: final_serial,
+					size: disk_size,
+					sector_size: sector_size_str,
+					temp: smart.temp || "-",
+					ptable: ptable_val,
+					sata_ver: smart.sata_ver || "-",
+					rpm: smart.rpm || "-",
+					health: smart.health || "-",
+					partitions: []
+				};
+
+				let potential_parts = fs.glob(block_path + "/" + dev_name + "*");
+				if (type(potential_parts) == "array") {
+					for (let j = 0; j < length(potential_parts); j++) {
+						let part_path = potential_parts[j];
+
+						if (!file_exists(part_path + "/partition")) {
+							continue;
+						}
+
+						let p_arr = split(part_path, "/");
+						let part_name = p_arr[length(p_arr) - 1];
+
+						if (match(part_name, /(boot[0-9]+|rpmb)$/)) {
+							continue;
+						}
+
+						let p_size_str = read_file(part_path + "/size");
+						let p_start_str = read_file(part_path + "/start");
+						let full_part_path = "/dev/" + part_name;
+
+						let p_info = fs_info[full_part_path] || { type: "unknown", mount: "" };
+						let p_df = df_info[full_part_path];
+
+						push(disk_obj.partitions, {
+							path: full_part_path,
+							name: part_name,
+							size: (int(p_size_str) || 0) * 512,
+							start: (int(p_start_str) || 0) * 512,
+							fs_type: p_info.type,
+							mount: p_info.mount,
+							used: p_df ? p_df.used : null,
+							free: p_df ? p_df.free : null,
+							usage: p_df ? p_df.usage : "-"
+						});
+					}
+				}
+				
+				push(disks, disk_obj);
+			}
+			
+			return { disks: disks, supported_fs: supported_fs };
+		}
+	},
+
+	get_smart_raw: {
+		args: { device: "string" },
+		call: function(req) {
+			if (!req.args || !req.args.device) return { code: 1, error: "Missing arguments" };
+			
+			if (!external_device(req.args.device)) return { code: 1, error: "External disk required" };
+			let out = exec_cmd("smartctl -a " + req.args.device);
+			let startIdx = index(out, "=== START OF ");
+			
+			if (startIdx >= 0) {
+				out = trim(substr(out, startIdx));
+			} else {
+				out = trim(replace(out, /^smartctl [\s\S]*?www\.smartmontools\.org\n+/, ""));
+			}
+			
+			return { code: 0, output: out };
+		}
+	},
+
+	eject_disk: {
+		args: { device: "string" },
+		call: function(req) {
+			if (!req.args || !req.args.device) return { code: 1, error: "Missing arguments" };
+			
+			let dev = req.args.device;
+			if (!external_device(dev)) return { code: 1, error: "External disk required (system disk protected)" };
+
+			let mounts = read_file("/proc/mounts");
+			let lines = split(mounts, "\n");
+			let umount_err = "";
+			
+			for (let i = 0; i < length(lines); i++) {
+				if (index(lines[i], dev) == 0) {
+					let m = split(lines[i], " ");
+					let suffix = substr(m[0], length(dev));
+					
+					if (suffix == "" || match(suffix, /^[p]?[0-9]+$/)) {
+						let out = exec_cmd("umount " + m[0] + " 2>&1");
+						if (match(out, /target is busy/i)) umount_err = out;
+					}
+				}
+			}
+			
+			if (umount_err != "") return { code: 1, error: "Disk busy: " + umount_err };
+
+			return { code: 0, output: "Ejected successfully" };
+		}
+	},
+
+	set_ptable: {
+		args: { device: "string", label: "string" },
+		call: function(req) {
+			if (!req.args) return { code: 1, error: "Missing arguments" };
+			
+			let dev = req.args.device;
+			let label = req.args.label;
+			
+			if (!external_device(dev)) return { code: 1, error: "External disk required (system disk protected)" };
+			if (in_use(dev, true)) return { code: 1, error: "Unmount all partitions first" };
+			if (label != "msdos" && label != "gpt") return { code: 1, error: "Invalid partition label" };
+
+			let cmd = sprintf("parted -s %s mklabel %s 2>&1", dev, label);
+			let out = exec_cmd(cmd);
+			
+			exec_cmd("partprobe " + dev); 
+			exec_cmd("sync");
+
+			if (match(out, /Error|Warning/i)) return { code: 1, error: out };
+			return { code: 0, output: out };
+		}
+	},
+
+	part_del: {
+		args: { device: "string", part_num: "string" },
+		call: function(req) {
+			if (!req.args) return { code: 1, error: "Missing arguments" };
+			
+			let dev = req.args.device;
+			let num = int(req.args.part_num);
+			
+			if (!external_device(dev)) return { code: 1, error: "External disk required (system disk protected)" };
+			if (in_use(dev, true)) return { code: 1, error: "Unmount all partitions first" };
+			if (!num || num <= 0 || num > 256) return { code: 1, error: "Invalid partition number" };
+			
+			let cmd = sprintf("parted -s %s rm %d 2>&1", dev, num);
+			let out = exec_cmd(cmd);
+			
+			exec_cmd("partprobe " + dev); 
+			exec_cmd("sync");
+			
+			return { code: 0, output: out };
+		}
+	},
+
+	part_add: {
+		args: { device: "string", type: "string", start: "string", end: "string" },
+		call: function(req) {
+			if (!req.args) return { code: 1, error: "Missing arguments" };
+			
+			let dev = req.args.device;
+			let type = req.args.type || "primary";
+			let start = int(req.args.start);
+			let end = int(req.args.end);
+			
+			if (!external_device(dev)) return { code: 1, error: "External disk required (system disk protected)" };
+			if (in_use(dev, true)) return { code: 1, error: "Unmount all partitions first" };
+			if (!match(type, /^(primary|extended|logical)$/)) return { code: 1, error: "Invalid partition type" };
+			if (start == null || end == null || start < 0 || end <= start) return { code: 1, error: "Missing sector bounds" };
+			
+			fix_gpt_if_needed(dev);
+			
+			let cmd = sprintf("parted -s -a optimal %s mkpart %s %ds %ds 2>&1", dev, type, start, end);
+			let out = exec_cmd(cmd);
+			
+			exec_cmd("partprobe " + dev); 
+			exec_cmd("sync");
+			
+			return { code: 0, output: out };
+		}
+	},
+
+	format_device: {
+		args: { device: "string", fstype: "string" },
+		call: function(req) {
+			if (!req.args) return { code: 1, error: "Missing arguments" };
+			
+			let dev = req.args.device;
+			let fstype = req.args.fstype;
+			
+			if (!dev || !external_device(dev)) return { code: 1, error: "External disk required (system disk protected)" };
+			if (!fstype || !match(fstype, /^(ext[234]|fat16|fat32|exfat)$/)) return { code: 1, error: "Invalid fstype" };
+			
+			if (in_use(dev, !file_exists("/sys/class/block/" + substr(dev, 5) + "/partition")))
+				return { code: 1, error: "Device is in use" };
+			
+			let force_flag = "";
+			if (match(fstype, /^ext/)) {
+				force_flag = "-F";
+			} else if (fstype == "xfs" || fstype == "btrfs" || fstype == "f2fs" || fstype == "swap" || fstype == "ntfs") {
+				force_flag = "-f";
+			}
+			
+			let cmd = "";
+			if (fstype == "swap") {
+				cmd = sprintf("mkswap %s %s 2>&1", force_flag, dev);
+			} else if (fstype == "fat32") {
+				cmd = sprintf("mkfs.fat -F 32 %s %s 2>&1", force_flag, dev);
+			} else if (fstype == "fat16") {
+				cmd = sprintf("mkfs.fat -F 16 %s %s 2>&1", force_flag, dev);
+			} else {
+				cmd = sprintf("mkfs.%s %s %s 2>&1", fstype, force_flag, dev);
+			}
+			
+			exec_cmd("mkdir -p -m 0700 /var/run/luci-diskman");
+			let task_dir = exec_cmd("mktemp -d /var/run/luci-diskman/task.XXXXXXXX");
+			if (!match(task_dir, /^\/var\/run\/luci-diskman\/task\.[a-zA-Z0-9]{8}$/))
+				return { code: 1, error: "Cannot create task directory" };
+			let task_id = substr(task_dir, length("/var/run/luci-diskman/"));
+			let log_file = task_dir + "/output";
+			let status_file = task_dir + "/status";
+			
+			exec_cmd("rm -f " + log_file + " " + status_file);
+			let bg_cmd = sprintf("( %s > %s 2>&1 ; echo $? > %s ; sync ) < /dev/null > /dev/null 2>&1 &", cmd, log_file, status_file);
+			exec_cmd(bg_cmd);
+			
+			return { code: 0, task_id: task_id, background: true };
+		}
+	},
+
+	umount_device: {
+		args: { device: "string" },
+		call: function(req) {
+			if (!req.args) return { code: 1, error: "Missing arguments" };
+			
+			let dev = req.args.device;
+			if (!dev || !external_device(dev)) return { code: 1, error: "External disk required (system disk protected)" };
+			
+			let cmd = sprintf("umount %s 2>&1", dev);
+			let out = exec_cmd(cmd);
+			let mounts = read_file("/proc/mounts");
+			
+			if (index(mounts, dev + " ") >= 0) {
+				return { code: 1, error: "Device is busy or failed to unmount", output: out };
+			}
+			
+			exec_cmd("sync");
+			return { code: 0, output: out };
+		}
+	},
+
+	mount_device: {
+		args: { device: "string", target: "string", options: "string" },
+		call: function(req) {
+			if (!req.args) return { code: 1, error: "Missing arguments" };
+			
+			let dev = req.args.device;
+			let target = req.args.target;
+			let options = req.args.options;
+			
+			if (!dev || !external_device(dev)) return { code: 1, error: "External disk required (system disk protected)" };
+			if (!target || !match(target, /^\/mnt\/[a-zA-Z0-9_-][a-zA-Z0-9_.-]*$/))
+				return { code: 1, error: "Use a directory directly under /mnt" };
+			let parent = fs.lstat("/mnt");
+			let existing = fs.lstat(target);
+			if (!parent || parent.type != "directory" || (existing && existing.type != "directory"))
+				return { code: 1, error: "Invalid mount directory" };
+			if (options && (!match(options, /^[a-zA-Z0-9_=-]+(,[a-zA-Z0-9_=-]+)*$/) ||
+			    match(options, /(^|,)(bind|rbind|move|remount|loop)(,|$)/)))
+				return { code: 1, error: "Invalid mount options" };
+
+			exec_cmd(sprintf("mkdir -p %s", target));
+
+			let opt_str = "";
+			if (options && options != "") {
+				opt_str = "-o " + options + " ";
+			}
+			
+			let cmd = sprintf("mount %s%s %s 2>&1", opt_str, dev, target);
+			let out = exec_cmd(cmd);
+			let mounts = read_file("/proc/mounts");
+			
+			if (index(mounts, dev + " ") < 0) {
+				return { code: 1, error: "Mount failed", output: out };
+			}
+			
+			return { code: 0, output: out };
+		}
+	},
+
+	check_task: {
+		args: { task_id: "string" },
+		call: function(req) {
+			if (!req.args || !req.args.task_id) return { code: 1, error: "Missing task_id" };
+			let task_id = req.args.task_id;
+			if (!match(task_id, /^task\.[a-zA-Z0-9]{8}$/)) return { code: 1, error: "Invalid task_id" };
+			let task_dir = "/var/run/luci-diskman/" + task_id;
+			let log_file = task_dir + "/output";
+			let status_file = task_dir + "/status";
+			
+			if (!file_exists(log_file)) {
+				return { code: 1, status: "not_found", error: "Task not found" };
+			}
+			
+			let out = read_file(log_file);
+			if (file_exists(status_file)) {
+				let exit_code = int(read_file(status_file));
+				exec_cmd("rm -f " + log_file + " " + status_file + "; rmdir " + task_dir);
+				
+				if (exit_code === 0) {
+					return { code: 0, status: "completed", output: out };
+				} else {
+					return { code: exit_code, status: "failed", error: out };
+				}
+			} else {
+				return { code: 0, status: "running", output: out };
+			}
+		}
+	}
+};
+
+return { "luci.diskman": methods };
